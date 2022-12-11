@@ -9,10 +9,10 @@ pub var fcr0: u32 = 0;
 pub var fcr31: u32 = 0;
 
 pub const FloatingPointRoundingMode = enum(u2) {
-    Nearest = 0b00,
-    TowardZero = 0b01,
-    Ceiling = 0b10,
-    Floor = 0b11
+    nearest = 0b00,
+    toward_zero = 0b01,
+    ceiling = 0b10,
+    floor = 0b11
 };
 
 pub const FloatingPointControlRegister31 = packed struct {
@@ -67,30 +67,82 @@ pub var ll_bit: bool = false;
 
 pub var cp0 = [_]u32{0} ** 32;
 const Cop0Register = enum(u8) {
-    cop0_index_reg,
-    cop0_random_reg,
-    cop0_entrylo0_reg,
-    cop0_entrylo1_reg,
-    cop0_context_reg,
-    cop0_pagemask_reg,
-    cop0_wired_reg,
-    cop0_bad_vaddr_reg = 8,
-    cop0_count_reg,
-    cop0_entryhi_reg,
-    cop0_compare_reg,
-    cop0_status_reg,
-    cop0_cause_reg,
-    cop0_epc_reg,
-    cop0_previd_reg,
-    cop0_config_reg,
-    cop0_lladdr_reg,
-    cop0_watchlo_reg,
-    cop0_watchhi_reg,
-    cop0_xcontext_reg,
-    cop0_taglo_reg = 28,
-    cop0_taghi_reg,
-    cop0_errorepc_reg
+    index,
+    random,
+    entrylo0,
+    entrylo1,
+    context,
+    pagemask,
+    wired,
+    bad_vaddr = 8,
+    count,
+    entryhi,
+    compare,
+    status,
+    cause,
+    epc,
+    previd,
+    config,
+    lladdr,
+    watchlo,
+    watchhi,
+    xcontext,
+    taglo = 28,
+    taghi,
+    errorepc
 };
+
+pub const InterruptBits = packed struct {
+    software_interrupt0: bool,
+    software_interrupt1: bool,
+    external: packed union {
+        flags: packed struct {
+            // TODO
+        },
+        bits: u5
+    },
+    timer_interrupt: bool
+};
+
+pub const Cop0StatusRegister = packed struct {
+    pub const PrivilegeMode = enum(u2) {
+        user = 0b10,
+        supervisor = 0b01,
+        kernel = 0b00
+    };
+
+    interrupt_enable: bool,
+    is_exception: bool,
+    is_error: bool,
+
+    // None of these should be used on the N64
+    privilege_level: PrivilegeMode,
+    is_64bit_user_address_space: bool,
+    is_64bit_supervisor_address_space: bool,
+    is_64bit_kernel_address_space: bool,
+    //
+
+    interrupt_mask: InterruptBits,
+    diagnostic_field: u9,
+
+    reverse_endian_user: bool,
+    floating_point_registers_enable: bool,
+    low_power_mode: bool,
+
+    coprocessor_enable: packed union {
+        flags: packed struct {
+            cop0_enable: bool,
+            cop1_enable: bool,
+            cop2_enable: bool,
+            cop3_enable: bool
+        },
+        bits: u4
+    }
+};
+
+pub fn getStatusFlags() *Cop0StatusRegister {
+    return @ptrCast(*Cop0StatusRegister, &cp0[@enumToInt(Cop0Register.status)]);
+}
 
 pub const InstructionBits = packed union {
     instruction: Instruction,
@@ -121,7 +173,9 @@ pub const Instruction = packed struct {
         dsrlv  = 0b010110,
         dsrl32 = 0b111110,
         dsub   = 0b101110,
-        dsubu  = 0b101111
+        dsubu  = 0b101111,
+        jalr   = 0b001001,
+        jr     = 0b001000
     };
 
     pub const CopSubOpcode = enum(u5) {
@@ -149,6 +203,10 @@ pub const Instruction = packed struct {
     };
 
     pub const Cop1Function = enum(u6) {
+    };
+
+    pub const Cop0Function = enum(u6) {
+        eret = 0b011000
     };
 
     data: packed union {
@@ -194,6 +252,10 @@ pub const Instruction = packed struct {
             fs: u5,
             rt: u5,
             fmt: u5
+        },
+        cop0: packed struct {
+            function: Cop0Function,
+            _unused: u20
         }
     },
     opcode: u6
@@ -202,6 +264,7 @@ pub const Instruction = packed struct {
 // On the N64 the PC is really only 32-bit, even though the processor is technically capable of a 64-bit mode.
 pub var pc: u32 = 0;
 var branch_target: ?i32 = null;
+var jump_target: ?u32 = null;
 
 pub const CpuError = error {
     UnknownInstruction,
@@ -212,7 +275,7 @@ pub const CpuError = error {
 pub fn init(hle_pif: bool) void {
     pc = CpuIoMap.pif_boot_rom_addr;
 
-    var t = InstructionBits { .bits = 2 };
+    var t = InstructionBits { .bits = 0 };
     interpreter.opcode_lookup[0b001000](t.instruction) catch unreachable; // FOR TESTING, SO THAT ZIG WILL COMPILE ALL INSTRUCTIONS
 
     if (hle_pif) {
@@ -222,7 +285,6 @@ pub fn init(hle_pif: bool) void {
 
 pub fn step() CpuError!void {
     gpr[0] = 0x0000000000000000;
-
 }
 
 const interpreter = struct {
@@ -244,15 +306,30 @@ const interpreter = struct {
         table[0b101111] = instCache;
         table[0b011000] = instDaddi;
         table[0b011001] = instDaddiu;
+        table[0b010000] = instCop0;
+        table[0b000010] = instJ;
+        table[0b000011] = instJal;
         break :init table;
     };
 
     inline fn branch(offset: i16) void {
-        branch_target = @as(i32, offset << 2);
+        branch_target = @as(i32, offset) << 2;
+    }
+
+    inline fn jump(target: u26) void {
+        jump_target = @as(u32, target) << 2;
+    }
+
+    inline fn jump_reg(reg: u5) void {
+        jump_target = @truncate(u32, gpr[reg]);
+    }
+
+    inline fn link_reg(reg: u5) void {
+        gpr[reg] = pc + 8;
     }
 
     inline fn link() void {
-        gpr[31] = pc + 8;
+        link_reg(31);
     }
 
     fn instSpecial(inst: Instruction) CpuError!void {
@@ -325,6 +402,12 @@ const interpreter = struct {
             return;
         } else if (r_type.function == Instruction.SpecialFunction.dsubu) {
             try instDsubu(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.jalr) {
+            try instJalr(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.jr) {
+            try instJr(inst);
             return;
         } else {
             std.log.err("Unknown SPECIAL function {b}", .{ @enumToInt(r_type.function) });
@@ -873,6 +956,51 @@ const interpreter = struct {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @bitCast(i64, gpr[r_type.rs]) -% @bitCast(i64, gpr[r_type.rt]));
         pc += 4;
+    }
+
+    fn instCop0(inst: Instruction) CpuError!void {
+        const cop = inst.data.cop0;
+        if (cop.function == Instruction.Cop0Function.eret) {
+            try instEret(inst);
+            return;
+        } else {
+            std.log.err("Unknown COP0 function {b}", .{ @enumToInt(cop.function) });
+            return error.UnknownInstruction;
+        }
+    }
+
+    inline fn instEret(_: Instruction) CpuError!void {
+        const status = getStatusFlags();
+        if (status.is_error) {
+            pc = cp0[@enumToInt(Cop0Register.errorepc)];
+            status.is_error = false;
+        } else {
+            pc = cp0[@enumToInt(Cop0Register.epc)];
+            status.is_exception = false;
+        }
+        ll_bit = false;
+    }
+
+    fn instJ(inst: Instruction) CpuError!void {
+        const j_type = inst.data.j_type;
+        jump(j_type.target);
+    }
+
+    fn instJal(inst: Instruction) CpuError!void {
+        const j_type = inst.data.j_type;
+        link();
+        jump(j_type.target);
+    }
+
+    inline fn instJalr(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        link_reg(r_type.rd);
+        jump_reg(r_type.rs);
+    }
+
+    inline fn instJr(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        jump_reg(r_type.rs);
     }
 
     fn instNop(_: Instruction) CpuError!void {
