@@ -15,7 +15,7 @@ pub const FloatingPointRoundingMode = enum(u2) {
     floor = 0b11
 };
 
-pub const FloatingPointControlRegister31 = packed struct {
+pub const FloatingPointControlRegister31 = packed struct(u32) {
     rounding_mode: FloatingPointRoundingMode,
     flags: packed union {
         flags: packed struct {
@@ -92,7 +92,7 @@ const Cop0Register = enum(u8) {
     errorepc
 };
 
-pub const InterruptBits = packed struct {
+pub const InterruptBits = packed struct(u8) {
     software_interrupt0: bool,
     software_interrupt1: bool,
     external: packed union {
@@ -104,7 +104,7 @@ pub const InterruptBits = packed struct {
     timer_interrupt: bool
 };
 
-pub const Cop0StatusRegister = packed struct {
+pub const Cop0StatusRegister = packed struct(u32) {
     pub const PrivilegeMode = enum(u2) {
         user = 0b10,
         supervisor = 0b01,
@@ -149,7 +149,7 @@ pub const InstructionBits = packed union {
     bits: u32
 };
 
-pub const Instruction = packed struct {
+pub const Instruction = packed struct(u32) {
     pub const SpecialFunction = enum(u6) {
         add    = 0b100000,
         addu   = 0b100001,
@@ -225,6 +225,11 @@ pub const Instruction = packed struct {
             rt: u5,
             rs: u5
         },
+        i_type_mem: packed struct {
+            offset: i16,
+            rt: u5,
+            base: u5
+        },
         i_type_branch: packed struct {
             offset: i16,
             rt: u5,
@@ -265,6 +270,7 @@ pub const Instruction = packed struct {
 pub var pc: u32 = 0;
 var branch_target: ?i32 = null;
 var jump_target: ?u32 = null;
+var is_delay_slot: bool = false;
 
 pub const CpuError = error {
     UnknownInstruction,
@@ -272,11 +278,13 @@ pub const CpuError = error {
     InvalidInstruction
 };
 
-pub fn init(hle_pif: bool) void {
-    pc = CpuIoMap.pif_boot_rom_addr;
+pub inline fn virtualToPhysical(vAddr: u32) u32 {
+    // TODO: Implement the TLB.
+    return vAddr & 0x1FFFFFFF;
+}
 
-    var t = InstructionBits { .bits = 0 };
-    interpreter.opcode_lookup[0b001000](t.instruction) catch unreachable; // FOR TESTING, SO THAT ZIG WILL COMPILE ALL INSTRUCTIONS
+pub fn init(hle_pif: bool) void {
+    pc = CpuIoMap.pif_boot_rom_base_addr;
 
     if (hle_pif) {
         @panic("PIF HLE not implemented!");
@@ -284,12 +292,28 @@ pub fn init(hle_pif: bool) void {
 }
 
 pub fn step() CpuError!void {
-    gpr[0] = 0x0000000000000000;
+    gpr[0] = 0;
+
+    var inst = InstructionBits { 
+        .bits = CpuIoMap.readAligned(u32, pc & 0x1FFFFFFF) 
+    };
+    try interpreter.opcode_lookup[inst.instruction.opcode](inst.instruction);
+
+    // Handle jumps and branches.
+    if ((jump_target != null or branch_target != null) and !is_delay_slot) {
+        is_delay_slot = true;
+    } else if (jump_target != null and is_delay_slot) {
+        pc = (pc & 0xF0000000) | jump_target.?;
+        jump_target = null;
+    } else if (branch_target != null and is_delay_slot) {
+        pc = (pc - 4) +% @bitCast(u32, branch_target.?);
+        branch_target = null;
+    }
 }
 
 const interpreter = struct {
     pub const opcode_lookup = init: { 
-        var table = [_]*const fn(Instruction) CpuError!void { instStub } ** std.math.maxInt(u6);
+        var table = [_]*const fn(Instruction) CpuError!void { instStub } ** (std.math.maxInt(u6)+1);
         table[0b000000] = instSpecial;
         table[0b001000] = instAddi;
         table[0b001001] = instAddiu;
@@ -309,6 +333,8 @@ const interpreter = struct {
         table[0b010000] = instCop0;
         table[0b000010] = instJ;
         table[0b000011] = instJal;
+        table[0b100000] = instLb;
+        table[0b100100] = instLbu;
         break :init table;
     };
 
@@ -410,7 +436,7 @@ const interpreter = struct {
             try instJr(inst);
             return;
         } else {
-            std.log.err("Unknown SPECIAL function {b}", .{ @enumToInt(r_type.function) });
+            std.log.err("Unknown SPECIAL function 0b{b}", .{ @enumToInt(r_type.function) });
             return error.UnknownInstruction;
         }
     }
@@ -490,7 +516,7 @@ const interpreter = struct {
                 try instBc1tl(inst);
                 return;
             } else {
-                std.log.err("Unknown COP branch condition {b}", .{ @enumToInt(i_type_branch.condition) });
+                std.log.err("Unknown COP branch condition 0b{b}", .{ @enumToInt(i_type_branch.condition) });
                 return error.UnknownInstruction;
             }
         } else if (r_type_cop.sub_opcode == Instruction.CopSubOpcode.cf) {
@@ -500,7 +526,7 @@ const interpreter = struct {
             try instCtc1(inst);
             return;
         } else {
-            std.log.err("Unknown COP1 sub-opcode {b}", .{ @enumToInt(i_type_branch.sub_opcode) });
+            std.log.err("Unknown COP1 sub-opcode 0b{b}", .{ @enumToInt(i_type_branch.sub_opcode) });
             return error.UnknownInstruction;
         }
     }
@@ -586,7 +612,7 @@ const interpreter = struct {
             try instBltzl(inst);
             return;
         } else {
-            std.log.err("Unknown REGIMM sub-opcode {b}", .{ @enumToInt(i_type_branch.sub_opcode) });
+            std.log.err("Unknown REGIMM sub-opcode 0b{b}", .{ @enumToInt(i_type_branch.sub_opcode) });
             return error.UnknownInstruction;
         }
     }
@@ -964,7 +990,7 @@ const interpreter = struct {
             try instEret(inst);
             return;
         } else {
-            std.log.err("Unknown COP0 function {b}", .{ @enumToInt(cop.function) });
+            std.log.err("Unknown COP0 function 0b{b}", .{ @enumToInt(cop.function) });
             return error.UnknownInstruction;
         }
     }
@@ -1001,6 +1027,22 @@ const interpreter = struct {
     inline fn instJr(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         jump_reg(r_type.rs);
+    }
+
+    fn instLb(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(@bitCast(u32, @bitCast(i32, @truncate(u32, gpr[i_type.base])) + @as(i32, i_type.offset)));
+        var result = CpuIoMap.readAligned(u8, physical_address);
+        gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i8, result)));
+        pc += 4;
+    }
+
+    fn instLbu(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(@bitCast(u32, @bitCast(i32, @truncate(u32, gpr[i_type.base])) + @as(i32, i_type.offset)));
+        var result = CpuIoMap.readAligned(u8, physical_address);
+        gpr[i_type.rt] = result;
+        pc += 4;
     }
 
     fn instNop(_: Instruction) CpuError!void {

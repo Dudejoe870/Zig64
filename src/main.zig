@@ -18,10 +18,14 @@ pub fn main() !u8 {
         return error.InvalidArgs;
     };
 
-    runEmulator(pif, rom);
+    try runEmulator(pif, rom);
     return 0;
 }
 
-fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8) void {
-    System.init(bootrom_path, rom_path);
+fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8) !void {
+    try System.init(bootrom_path, rom_path);
+
+    while (true) {
+        try System.step();
+    }
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 fn MemRange(comptime size_in_bytes: u32, comptime read_event: ?fn(u32) void, comptime write_event: ?fn(u32, u32, u32) bool) type {
     return struct {
@@ -6,12 +7,12 @@ fn MemRange(comptime size_in_bytes: u32, comptime read_event: ?fn(u32) void, com
 
         buf: [size_in_bytes]u8 = [_]u8{0} ** size_in_bytes,
 
-        fn writeWord(self: *Self, offset: u32, value: u32) void {
+        inline fn writeWord(self: *Self, offset: u32, value: u32) void {
             var dst_ptr = @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
             dst_ptr.* = value;
         }
 
-        fn readWord(self: *Self, offset: u32) u32 {
+        inline fn readWord(self: *Self, offset: u32) u32 {
             var dst_ptr = @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
             return dst_ptr.*;
         }
@@ -20,16 +21,40 @@ fn MemRange(comptime size_in_bytes: u32, comptime read_event: ?fn(u32) void, com
         // and there are no byteswaps involved. The way this is accomplished is using masking.
         // By calculating the mask we need based on the 32-bit boundary, we can simplify IO register events, 
         // and store everything in the CPUs native endian. (This is based off of mupen64plus's memory handling)
-        fn writeWordMasked(self: *Self, offset: u32, value: u32, mask: u32) void {
+        inline fn writeWordMasked(self: *Self, offset: u32, value: u32, mask: u32) void {
             var dst_ptr = @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
             dst_ptr.* = (dst_ptr.* & ~mask) | (value & mask);
         }
 
-        pub fn writeAligned(self: *Self, offset: u32, value: anytype) void {
+        pub fn writeFromFile(self: *Self, file: std.fs.File) !usize {
+            if (builtin.target.cpu.arch.endian() == .Little) {
+                var index: usize = 0;
+                var buffer_left: usize = self.buf.len;
+                while (index != self.buf.len and buffer_left != 0) {
+                    var u32_buffer: [4]u8 = undefined;
+                    const amt = try file.read(u32_buffer[0..std.math.min(3, buffer_left-1)]);
+                    if (amt == 0) break;
+
+                    // Swap the Big-Endian bytes around.
+                    var i: usize = 0;
+                    while (i < amt) {
+                        self.buf[index + (amt - i)] = u32_buffer[i];
+                        i += 1;
+                    }
+                    index += amt;
+                    buffer_left -= amt;
+                }
+                return index;
+            } else {
+                return file.readAll(&self.buf);
+            }
+        }
+
+        pub inline fn writeAligned(self: *Self, offset: u32, value: anytype) void {
             var should_write: bool = true;
             var aligned_offset: u32 = offset;
 
-            const T: type = @TypeOf(value);
+            const T = @TypeOf(value);
 
             if (T == u32) {
                 aligned_offset &= ~@as(u32, 0b11);
@@ -47,8 +72,7 @@ fn MemRange(comptime size_in_bytes: u32, comptime read_event: ?fn(u32) void, com
                 var shift: u5 = undefined;
                 if (T == u16) {
                     shift = ((@truncate(u5, offset) & 2) ^ 2) << 3;
-                }
-                else if (T == u8) {
+                } else if (T == u8) {
                     shift = ((@truncate(u5, offset) & 3) ^ 3) << 3;
                 }
 
@@ -64,7 +88,7 @@ fn MemRange(comptime size_in_bytes: u32, comptime read_event: ?fn(u32) void, com
             }
         }
 
-        pub fn readAligned(self: *Self, comptime T: type, offset: u32) T {
+        pub inline fn readAligned(self: *Self, comptime T: type, offset: u32) T {
             var aligned_offset: u32 = offset;
 
             if (T == u32) {
@@ -72,18 +96,15 @@ fn MemRange(comptime size_in_bytes: u32, comptime read_event: ?fn(u32) void, com
 
                 if (read_event) |event| event(aligned_offset);
                 return self.readWord(aligned_offset);
-            }
-            else if (T == u64) {
+            } else if (T == u64) {
                 aligned_offset &= ~@as(u32, 0b111);
                 return self.readAligned(u32, aligned_offset + 4) | (@intCast(u64, self.readAligned(u32, aligned_offset)) << 32);
-            }
-            else if (T == u8 or T == u16) {
+            } else if (T == u8 or T == u16) {
                 var shift: u5 = undefined;
                 if (T == u16) {
                     aligned_offset &= ~@as(u32, 0b1);
                     shift = ((@truncate(u5, aligned_offset) & 2) ^ 2) << 3;
-                }
-                else if (T == u8) {
+                } else if (T == u8) {
                     shift = ((@truncate(u5, aligned_offset) & 3) ^ 3) << 3;
                 }
 
@@ -92,15 +113,14 @@ fn MemRange(comptime size_in_bytes: u32, comptime read_event: ?fn(u32) void, com
 
                 if (read_event) |event| event(aligned_offset);
                 return @truncate(T, result >> shift);
-            }
-            else {
+            } else {
                 @compileError("Invalid type for IO read!");
             }
         }
     };
 }
 
-const rdram = struct {
+pub const rdram = struct {
     pub const dram_size = 0x800000;
     pub var dram = MemRange(0x800000, null, null) { };
 
@@ -122,9 +142,9 @@ const rdram = struct {
         rdram_device_manuf_reg = 0x24
     };
 
-    pub fn getReg(offset: RegRangeOffset, module: u8) *u32 {
-        return @alignCast(@alignOf(u32), @ptrCast(*align(1) u32, 
-            &reg_range.buf[(@as(u32, module) * (@as(u32, rdram_module_reg_count)*@sizeOf(u32))) + @enumToInt(offset)]));
+    pub fn getReg(offset: RegRangeOffset, module: u8) *align(1) u32 {
+        return @ptrCast(*align(1) u32, 
+            &reg_range.buf[(@as(u32, module) * (@as(u32, rdram_module_reg_count)*@sizeOf(u32))) + @enumToInt(offset)]);
     }
 
     fn init() void {
@@ -144,8 +164,8 @@ const rdram = struct {
     }
 };
 
-const rcp = struct {
-    const rsp = struct {
+pub const rcp = struct {
+    pub const rsp = struct {
         pub var dmem = MemRange(0x1000, null, null) { };
         pub var imem = MemRange(0x1000, null, null) { };
 
@@ -168,7 +188,7 @@ const rcp = struct {
         };
     };
 
-    const rdp = struct {
+    pub const rdp = struct {
         pub var cmd = MemRange(8*@sizeOf(u32), null, null) { };
         pub const CmdRangeOffset = enum(u8) {
             dpc_start_reg = 0x00,
@@ -190,7 +210,7 @@ const rcp = struct {
         };
     };
 
-    const mi = struct {
+    pub const mi = struct {
         pub var reg_range = MemRange(4*@sizeOf(u32), null, null) { };
         pub const RegRangeOffset = enum(u8) {
             mi_init_mode_reg = 0x00,
@@ -200,7 +220,7 @@ const rcp = struct {
         };
     };
 
-    const vi = struct {
+    pub const vi = struct {
         pub var reg_range = MemRange(14*@sizeOf(u32), null, null) { };
         pub const RegRangeOffset = enum(u8) {
             vi_status_reg = 0x00,
@@ -220,7 +240,7 @@ const rcp = struct {
         };
     };
 
-    const ai = struct {
+    pub const ai = struct {
         pub var reg_range = MemRange(6*@sizeOf(u32), null, null) { };
         pub const RegRangeOffset = enum(u8) {
             ai_dram_addr_reg = 0x00,
@@ -232,7 +252,7 @@ const rcp = struct {
         };
     };
 
-    const pi = struct {
+    pub const pi = struct {
         pub var reg_range = MemRange(13*@sizeOf(u32), null, null) { };
         pub const RegRangeOffset = enum(u8) {
             pi_dram_addr_reg = 0x00,
@@ -253,7 +273,7 @@ const rcp = struct {
         };
     };
 
-    const ri = struct {
+    pub const ri = struct {
         pub var reg_range = MemRange(8*@sizeOf(u32), null, null) { };
         pub const RegRangeOffset = enum(u8) {
             ri_mode_reg = 0x00,
@@ -267,7 +287,7 @@ const rcp = struct {
         };
     };
 
-    const si = struct {
+    pub const si = struct {
         pub var reg_range = MemRange(7*@sizeOf(u32), null, null) { };
         pub const RegRangeOffset = enum(u8) {
             si_dram_addr_reg = 0x00,
@@ -276,6 +296,21 @@ const rcp = struct {
             si_status_reg = 0x18
         };
     };
+};
+
+pub const cart = struct {
+    // My current design sort of accidentally avoids dynamic memory allocation 
+    // (could mean that if I made the other parts of the emulator have some amount of abstraction, 
+    // this emulator could run on bare metal),
+    // so we just statically allocate the biggest size a cart could *technically* be. 
+    // (More likely to be max 64MB, but 255MB is a fairly small size to allocate in RAM anyway)
+    pub const max_cart_size = 255459327;
+    pub var rom = MemRange(max_cart_size, null, null) { };
+};
+
+pub const pif = struct {
+    pub var boot_rom = MemRange(2048, null, null) { };
+    pub var ram = MemRange(64, null, null) { };
 };
 
 pub fn init() void {
