@@ -330,9 +330,11 @@ pub fn step() CpuError!void {
     } else if (jump_target != null and is_delay_slot) {
         pc = (pc & 0xF0000000) | jump_target.?;
         jump_target = null;
+        is_delay_slot = false;
     } else if (branch_target != null and is_delay_slot) {
         pc = (pc - 4) +% @bitCast(u32, branch_target.?);
         branch_target = null;
+        is_delay_slot = false;
     }
 }
 
