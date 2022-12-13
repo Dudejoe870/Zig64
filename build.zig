@@ -1,10 +1,17 @@
 const Builder = @import("std").build.Builder;
 
-pub fn build(b: *Builder) void {
+const glfw = @import("external/mach-glfw/build.zig");
+
+pub fn build(b: *Builder) !void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
 
     const exe = b.addExecutable("zig64", "src/main.zig");
+
+    exe.addPackagePath("gl", "opengl/gl_4v6.zig");
+
+    exe.addPackage(glfw.pkg);
+    try glfw.link(b, exe, .{ });
 
     exe.setTarget(target);
     exe.setBuildMode(mode);

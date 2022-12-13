@@ -1,0 +1,4 @@
+[submodule "external/mach-glfw"]
+	path = external/mach-glfw
+	url = https://github.com/hexops/mach-glfw.git
+	branch = main
