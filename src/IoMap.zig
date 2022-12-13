@@ -1,6 +1,8 @@
 const std = @import("std");
 const memory = @import("memory.zig");
 
+const log = std.log.scoped(.IoMap);
+
 pub const rdram_base_addr: u32 = 0x00000000;
 pub const rdram_reg_base_addr: u32 = 0x03f00000;
 
@@ -64,7 +66,7 @@ pub inline fn writeAligned(physical_address: u32, value: anytype) void {
         }
     }
 
-    std.log.warn("Trying to write to unmapped memory at address 0x{X}!", .{ physical_address });
+    log.warn("Trying to write to unmapped memory at address 0x{X}!", .{ physical_address });
     return;
 }
 
@@ -79,6 +81,6 @@ pub inline fn readAligned(comptime T: type, physical_address: u32) T {
         }
     }
 
-    std.log.warn("Trying to read from unmapped memory at address 0x{X}!", .{ physical_address });
+    log.warn("Trying to read from unmapped memory at address 0x{X}!", .{ physical_address });
     return @as(T, 0);
 }

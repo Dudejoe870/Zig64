@@ -1,6 +1,8 @@
 const std = @import("std");
 const IoMap = @import("IoMap.zig");
 
+const log = std.log.scoped(.R4300);
+
 pub var gpr = [_]u64{0} ** 32;
 
 pub var fpr = [_]u64{0} ** 32;
@@ -316,8 +318,7 @@ pub fn step() CpuError!void {
     var inst = InstructionBits { 
         .bits = IoMap.readAligned(u32, pc & 0x1FFFFFFF) 
     };
-    
-    //std.log.debug("0x{X}: 0x{X}", .{ pc, inst.bits });
+
     if (inst.bits != 0) {
         try interpreter.opcode_lookup[inst.instruction.opcode](inst.instruction);
     } else {
@@ -542,7 +543,7 @@ const interpreter = struct {
             try instXor(inst);
             return;
         } else {
-            std.log.err("Unknown SPECIAL function 0b{b}", .{ @enumToInt(r_type.function) });
+            log.err("Unknown SPECIAL function 0b{b}", .{ @enumToInt(r_type.function) });
             return error.UnknownInstruction;
         }
     }
@@ -553,7 +554,7 @@ const interpreter = struct {
         var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
         var result: i32 = 0;
         if (@addWithOverflow(i32, rs, rt, &result)) {
-            std.log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -567,7 +568,7 @@ const interpreter = struct {
         var immediate = @as(i32, @bitCast(i16, i_type.immediate));
         var result: i32 = 0;
         if (@addWithOverflow(i32, rs, immediate, &result)) {
-            std.log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -622,7 +623,7 @@ const interpreter = struct {
                 try instBc1tl(inst);
                 return;
             } else {
-                std.log.err("Unknown COP branch condition 0b{b}", .{ @enumToInt(i_type_branch.condition) });
+                log.err("Unknown COP branch condition 0b{b}", .{ @enumToInt(i_type_branch.condition) });
                 return error.UnknownInstruction;
             }
         } else if (r_type_cop.sub_opcode == Instruction.CopSubOpcode.cf) {
@@ -638,7 +639,7 @@ const interpreter = struct {
             try instMtc1(inst);
             return;
         } else {
-            std.log.err("Unknown COP1 sub-opcode 0b{b}", .{ @enumToInt(i_type_branch.sub_opcode) });
+            log.err("Unknown COP1 sub-opcode 0b{b}", .{ @enumToInt(i_type_branch.sub_opcode) });
             return error.UnknownInstruction;
         }
     }
@@ -724,7 +725,7 @@ const interpreter = struct {
             try instBltzl(inst);
             return;
         } else {
-            std.log.err("Unknown REGIMM sub-opcode 0b{b}", .{ @enumToInt(i_type_branch.sub_opcode) });
+            log.err("Unknown REGIMM sub-opcode 0b{b}", .{ @enumToInt(i_type_branch.sub_opcode) });
             return error.UnknownInstruction;
         }
     }
@@ -872,12 +873,12 @@ const interpreter = struct {
     }
 
     inline fn instBreak(_: Instruction) CpuError!void {
-        std.log.err("BREAK instruction not implemented.", .{ });
+        log.err("BREAK instruction not implemented.", .{ });
         return error.NotImplemented;
     }
 
     fn instCache(_: Instruction) CpuError!void {
-        std.log.debug("CACHE Instruction Stubbed.", .{ });
+        log.debug("CACHE Instruction Stubbed.", .{ });
         pc += 4;
     }
 
@@ -888,7 +889,7 @@ const interpreter = struct {
         } else if (r_type_cop.rt == 31) {
             gpr[r_type_cop.rd] = @bitCast(u64, @as(i64, fcr31));
         } else {
-            std.log.err("The CFC1 instruction only works with the FCRs 0 and 31", .{ });
+            log.err("The CFC1 instruction only works with the FCRs 0 and 31", .{ });
             return error.InvalidInstruction;
         }
         pc += 4;
@@ -901,7 +902,7 @@ const interpreter = struct {
         } else if (r_type_cop.rt == 31) {
             fcr31 = @truncate(u32, gpr[r_type_cop.rt]);
         } else {
-            std.log.err("The CTC1 instruction only works with the FCRs 0 and 31", .{ });
+            log.err("The CTC1 instruction only works with the FCRs 0 and 31", .{ });
             return error.InvalidInstruction;
         }
         cp1_coc = getFcr31Flags().condition;
@@ -912,7 +913,7 @@ const interpreter = struct {
         const r_type = inst.data.r_type;
         var result: i64 = 0;
         if (@addWithOverflow(i64, @bitCast(i64, gpr[r_type.rs]), @bitCast(i64, gpr[r_type.rt]), &result)) {
-            std.log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -925,7 +926,7 @@ const interpreter = struct {
         var immediate = @as(i64, @bitCast(i16, i_type.immediate));
         var result: i64 = 0;
         if (@addWithOverflow(i64, @bitCast(i64, gpr[i_type.rs]), immediate, &result)) {
-            std.log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1082,7 +1083,7 @@ const interpreter = struct {
         const r_type = inst.data.r_type;
         var result: i64 = 0;
         if (@subWithOverflow(i64, @bitCast(i64, gpr[r_type.rs]), @bitCast(i64, gpr[r_type.rt]), &result)) {
-            std.log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1109,7 +1110,7 @@ const interpreter = struct {
             try instMtc0(inst);
             return;
         } else {
-            std.log.err("Unknown COP0 function 0b{b}", .{ @enumToInt(generic.function) });
+            log.err("Unknown COP0 function 0b{b}", .{ @enumToInt(generic.function) });
             return error.UnknownInstruction;
         }
     }
@@ -1168,7 +1169,7 @@ const interpreter = struct {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         if (physical_address & 0b111 != 0) {
-            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1180,7 +1181,7 @@ const interpreter = struct {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         if (physical_address & 0b111 != 0) {
-            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1195,7 +1196,7 @@ const interpreter = struct {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         if (physical_address & 0b1 != 0) {
-            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1207,7 +1208,7 @@ const interpreter = struct {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         if (physical_address & 0b1 != 0) {
-            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1225,7 +1226,7 @@ const interpreter = struct {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         if (physical_address & 0b11 != 0) {
-            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1237,7 +1238,7 @@ const interpreter = struct {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         if (physical_address & 0b11 != 0) {
-            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1252,7 +1253,7 @@ const interpreter = struct {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         if (physical_address & 0b11 != 0) {
-            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1355,7 +1356,7 @@ const interpreter = struct {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         if (physical_address & 0b111 != 0) {
-            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1367,7 +1368,7 @@ const interpreter = struct {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         if (physical_address & 0b111 != 0) {
-            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1382,7 +1383,7 @@ const interpreter = struct {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         if (physical_address & 0b1 != 0) {
-            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1462,7 +1463,7 @@ const interpreter = struct {
         var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
         var result: i32 = 0;
         if (@subWithOverflow(i32, rs, rt, &result)) {
-            std.log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1482,7 +1483,7 @@ const interpreter = struct {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         if (physical_address & 0b11 != 0) {
-            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1494,7 +1495,7 @@ const interpreter = struct {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         if (physical_address & 0b11 != 0) {
-            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
             pc += 4;
             return;
         }
@@ -1520,7 +1521,7 @@ const interpreter = struct {
     }
 
     fn instStub(inst: Instruction) CpuError!void {
-        std.log.warn("Unimplemented Instruction 0b{b} at address 0x{X}!", .{ inst.opcode, pc });
+        log.warn("Unimplemented Instruction 0b{b} at address 0x{X}!", .{ inst.opcode, pc });
         return error.NotImplemented;
     }
 };

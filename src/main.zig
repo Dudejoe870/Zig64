@@ -30,7 +30,20 @@ pub fn main() !u8 {
     return 0;
 }
 
+var running: bool = true;
+
+fn runSystem() !void {
+    while (running) {
+        try System.step();
+    }
+}
+
 fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8) !void {
+    try System.init(bootrom_path, rom_path);
+
+    var system_thread = try std.Thread.spawn(.{ }, runSystem, .{ });
+    try system_thread.setName("Emulator Thread");
+    
     try glfw.init(.{});
     defer glfw.terminate();
 
@@ -46,16 +59,14 @@ fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8) !void {
     const proc: glfw.GLProc = undefined;
     try gl.load(proc, glGetProcAddress);
 
-    try System.init(bootrom_path, rom_path);
-
     while (!window.shouldClose()) {
         try glfw.pollEvents();
 
         gl.clearColor(0, 0, 0, 1);
         gl.clear(gl.COLOR_BUFFER_BIT);
 
-        try System.step();
-
         try window.swapBuffers();
     }
+    running = false;
+    system_thread.join();
 }
