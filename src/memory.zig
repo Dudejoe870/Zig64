@@ -30,15 +30,15 @@ fn MemRange(comptime size_in_bytes: u32, comptime read_event: ?fn(u32) void, com
             if (builtin.target.cpu.arch.endian() == .Little) {
                 var index: usize = 0;
                 var buffer_left: usize = self.buf.len;
-                while (index != self.buf.len and buffer_left != 0) {
+                while (buffer_left >= 4) {
                     var u32_buffer: [4]u8 = undefined;
-                    const amt = try file.read(u32_buffer[0..std.math.min(3, buffer_left-1)]);
+                    const amt = try file.read(u32_buffer[0..]);
                     if (amt == 0) break;
 
                     // Swap the Big-Endian bytes around.
                     var i: usize = 0;
                     while (i < amt) {
-                        self.buf[index + (amt - i)] = u32_buffer[i];
+                        self.buf[index + ((amt-1) - i)] = u32_buffer[i];
                         i += 1;
                     }
                     index += amt;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const CpuIoMap = @import("CpuIoMap.zig");
+const IoMap = @import("IoMap.zig");
 
 pub var gpr = [_]u64{0} ** 32;
 
@@ -175,13 +175,32 @@ pub const Instruction = packed struct(u32) {
         dsub   = 0b101110,
         dsubu  = 0b101111,
         jalr   = 0b001001,
-        jr     = 0b001000
+        jr     = 0b001000,
+        mfhi   = 0b010000,
+        mflo   = 0b010010,
+        mthi   = 0b010001,
+        mtlo   = 0b010011,
+        mult   = 0b011000,
+        multu  = 0b011001,
+        nor    = 0b100111,
+        _or    = 0b100101,
+        sll    = 0b000000,
+        sllv   = 0b000100,
+        slt    = 0b101010,
+        sltu   = 0b101011,
+        sra    = 0b000011,
+        srav   = 0b000111,
+        sub    = 0b100010,
+        subu   = 0b100011,
+        xor    = 0b100110
     };
 
     pub const CopSubOpcode = enum(u5) {
         bc = 0b01000, // Branch Conditional
         cf = 0b00010, // Move Control From
-        ct = 0b00110 // Move Control To
+        ct = 0b00110, // Move Control To
+        mf = 0b00000, // Move From
+        mt = 0b00100  // Move To
     };
 
     pub const CopBranchCondition = enum(u5) {
@@ -225,6 +244,19 @@ pub const Instruction = packed struct(u32) {
             rt: u5,
             rs: u5
         },
+        r_type_cop: packed struct {
+            _: u11,
+            rd: u5,
+            rt: u5,
+            sub_opcode: CopSubOpcode
+        },
+        r_type_cop1: packed struct {
+            function: Cop1Function,
+            fd: u5,
+            fs: u5,
+            rt: u5,
+            fmt: u5
+        },
         i_type_mem: packed struct {
             offset: i16,
             rt: u5,
@@ -245,20 +277,7 @@ pub const Instruction = packed struct(u32) {
             condition: CopBranchCondition,
             sub_opcode: CopSubOpcode
         },
-        r_type_cop: packed struct {
-            _: u11,
-            rd: u5,
-            rt: u5,
-            sub_opcode: CopSubOpcode
-        },
-        r_type_cop1: packed struct {
-            function: Cop1Function,
-            fd: u5,
-            fs: u5,
-            rt: u5,
-            fmt: u5
-        },
-        cop0: packed struct {
+        cop0_generic: packed struct {
             function: Cop0Function,
             _unused: u20
         }
@@ -284,7 +303,7 @@ pub inline fn virtualToPhysical(vAddr: u32) u32 {
 }
 
 pub fn init(hle_pif: bool) void {
-    pc = CpuIoMap.pif_boot_rom_base_addr;
+    pc = IoMap.pif_boot_rom_base_addr;
 
     if (hle_pif) {
         @panic("PIF HLE not implemented!");
@@ -295,9 +314,15 @@ pub fn step() CpuError!void {
     gpr[0] = 0;
 
     var inst = InstructionBits { 
-        .bits = CpuIoMap.readAligned(u32, pc & 0x1FFFFFFF) 
+        .bits = IoMap.readAligned(u32, pc & 0x1FFFFFFF) 
     };
-    try interpreter.opcode_lookup[inst.instruction.opcode](inst.instruction);
+    
+    //std.log.debug("0x{X}: 0x{X}", .{ pc, inst.bits });
+    if (inst.bits != 0) {
+        try interpreter.opcode_lookup[inst.instruction.opcode](inst.instruction);
+    } else {
+        pc += 4;
+    }
 
     // Handle jumps and branches.
     if ((jump_target != null or branch_target != null) and !is_delay_slot) {
@@ -317,6 +342,7 @@ const interpreter = struct {
         table[0b000000] = instSpecial;
         table[0b001000] = instAddi;
         table[0b001001] = instAddiu;
+        table[0b001100] = instAndi;
         table[0b010001] = instCop1;
         table[0b000100] = instBeq;
         table[0b010100] = instBeql;
@@ -335,6 +361,29 @@ const interpreter = struct {
         table[0b000011] = instJal;
         table[0b100000] = instLb;
         table[0b100100] = instLbu;
+        table[0b110111] = instLd;
+        table[0b110101] = instLdc1;
+        // TODO: Implement LDL and LDR
+        table[0b100001] = instLh;
+        table[0b100101] = instLhu;
+        table[0b001111] = instLui;
+        table[0b100011] = instLw;
+        table[0b110001] = instLwc1;
+        // TODO: Implement LWL and LWR
+        table[0b100111] = instLwu;
+        table[0b001101] = instOri;
+        table[0b101000] = instSb;
+        table[0b111111] = instSd;
+        table[0b111101] = instSdc1;
+        // TODO: Implement SDL and SDR
+        table[0b101001] = instSh;
+        table[0b001010] = instSlti;
+        table[0b001011] = instSltiu;
+        table[0b101011] = instSw;
+        table[0b111001] = instSwc1;
+        // TODO: Implement SWL and SWR
+        // TODO: Implement the TLB alongside the TLBP, TLBR, TLBWI, and TLBWR instructions
+        table[0b001110] = instXori;
         break :init table;
     };
 
@@ -346,16 +395,20 @@ const interpreter = struct {
         jump_target = @as(u32, target) << 2;
     }
 
-    inline fn jump_reg(reg: u5) void {
+    inline fn jumpReg(reg: u5) void {
         jump_target = @truncate(u32, gpr[reg]);
     }
 
-    inline fn link_reg(reg: u5) void {
+    inline fn linkReg(reg: u5) void {
         gpr[reg] = pc + 8;
     }
 
     inline fn link() void {
-        link_reg(31);
+        linkReg(31);
+    }
+
+    inline fn calculateAddress(base: u5, offset: i16) u32 {
+        return @bitCast(u32, @bitCast(i32, @truncate(u32, gpr[base])) + @as(i32, offset));
     }
 
     fn instSpecial(inst: Instruction) CpuError!void {
@@ -434,6 +487,57 @@ const interpreter = struct {
             return;
         } else if (r_type.function == Instruction.SpecialFunction.jr) {
             try instJr(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.mfhi) {
+            try instMfhi(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.mflo) {
+            try instMflo(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.mthi) {
+            try instMthi(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.mtlo) {
+            try instMtlo(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.mult) {
+            try instMult(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.multu) {
+            try instMultu(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.nor) {
+            try instNor(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction._or) {
+            try instOr(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.sll) {
+            try instSll(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.sllv) {
+            try instSllv(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.slt) {
+            try instSlt(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.sltu) {
+            try instSltu(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.sra) {
+            try instSra(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.srav) {
+            try instSrav(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.sub) {
+            try instSub(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.subu) {
+            try instSubu(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.xor) {
+            try instXor(inst);
             return;
         } else {
             std.log.err("Unknown SPECIAL function 0b{b}", .{ @enumToInt(r_type.function) });
@@ -524,6 +628,12 @@ const interpreter = struct {
             return;
         } else if (r_type_cop.sub_opcode == Instruction.CopSubOpcode.ct) {
             try instCtc1(inst);
+            return;
+        } else if (r_type_cop.sub_opcode == Instruction.CopSubOpcode.mf) {
+            try instMfc1(inst);
+            return;
+        } else if (r_type_cop.sub_opcode == Instruction.CopSubOpcode.mt) {
+            try instMtc1(inst);
             return;
         } else {
             std.log.err("Unknown COP1 sub-opcode 0b{b}", .{ @enumToInt(i_type_branch.sub_opcode) });
@@ -985,12 +1095,19 @@ const interpreter = struct {
     }
 
     fn instCop0(inst: Instruction) CpuError!void {
-        const cop = inst.data.cop0;
-        if (cop.function == Instruction.Cop0Function.eret) {
+        const generic = inst.data.cop0_generic;
+        const r_type = inst.data.r_type_cop;
+        if (generic.function == Instruction.Cop0Function.eret) {
             try instEret(inst);
             return;
+        } else if (r_type.sub_opcode == Instruction.CopSubOpcode.mf) {
+            try instMfc0(inst);
+            return;
+        } else if (r_type.sub_opcode == Instruction.CopSubOpcode.mt) {
+            try instMtc0(inst);
+            return;
         } else {
-            std.log.err("Unknown COP0 function 0b{b}", .{ @enumToInt(cop.function) });
+            std.log.err("Unknown COP0 function 0b{b}", .{ @enumToInt(generic.function) });
             return error.UnknownInstruction;
         }
     }
@@ -1020,37 +1137,388 @@ const interpreter = struct {
 
     inline fn instJalr(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
-        link_reg(r_type.rd);
-        jump_reg(r_type.rs);
+        linkReg(r_type.rd);
+        jumpReg(r_type.rs);
     }
 
     inline fn instJr(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
-        jump_reg(r_type.rs);
+        jumpReg(r_type.rs);
     }
 
     fn instLb(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(@bitCast(u32, @bitCast(i32, @truncate(u32, gpr[i_type.base])) + @as(i32, i_type.offset)));
-        var result = CpuIoMap.readAligned(u8, physical_address);
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        var result = IoMap.readAligned(u8, physical_address);
         gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i8, result)));
         pc += 4;
     }
 
     fn instLbu(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(@bitCast(u32, @bitCast(i32, @truncate(u32, gpr[i_type.base])) + @as(i32, i_type.offset)));
-        var result = CpuIoMap.readAligned(u8, physical_address);
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        var result = IoMap.readAligned(u8, physical_address);
         gpr[i_type.rt] = result;
         pc += 4;
     }
 
-    fn instNop(_: Instruction) CpuError!void {
+    fn instLd(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        if (physical_address & 0b111 != 0) {
+            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        gpr[i_type.rt] = IoMap.readAligned(u64, physical_address);
+        pc += 4;
+    }
+
+    fn instLdc1(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        if (physical_address & 0b111 != 0) {
+            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
+        fpr[i_type.rt] = IoMap.readAligned(u64, physical_address);
+        pc += 4;
+    }
+
+    // TODO: Implement LDL and LDR
+
+    fn instLh(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        if (physical_address & 0b1 != 0) {
+            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i16, IoMap.readAligned(u16, physical_address))));
+        pc += 4;
+    }
+
+    fn instLhu(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        if (physical_address & 0b1 != 0) {
+            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        gpr[i_type.rt] = IoMap.readAligned(u16, physical_address);
+        pc += 4;
+    }
+
+    fn instLui(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type;
+        gpr[i_type.rt] = @bitCast(u64, @as(i64, @as(i32, @bitCast(i16, i_type.immediate)) << 16));
+        pc += 4;
+    }
+
+    fn instLw(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        if (physical_address & 0b11 != 0) {
+            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i32, IoMap.readAligned(u32, physical_address))));
+        pc += 4;
+    }
+
+    fn instLwc1(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        if (physical_address & 0b11 != 0) {
+            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
+        fpr[i_type.rt] = IoMap.readAligned(u32, physical_address);
+        pc += 4;
+    }
+
+    // TODO: Implement LWL and LWR
+
+    fn instLwu(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        if (physical_address & 0b11 != 0) {
+            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        gpr[i_type.rt] = IoMap.readAligned(u32, physical_address);
+        pc += 4;
+    }
+
+    inline fn instMfc0(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type_cop;
+        gpr[r_type.rt] = cp0[r_type.rd];
+        pc += 4;
+    }
+
+    inline fn instMfc1(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type_cop;
+        gpr[r_type.rt] = @bitCast(u64, @as(i64, @bitCast(i32, @truncate(u32, fpr[r_type.rd]))));
+        pc += 4;
+    }
+
+    inline fn instMfhi(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = hi;
+        pc += 4;
+    }
+
+    inline fn instMflo(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = lo;
+        pc += 4;
+    }
+    
+    inline fn instMtc0(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type_cop;
+        cp0[r_type.rd] = @truncate(u32, gpr[r_type.rt]);
+        pc += 4;
+    }
+
+    inline fn instMtc1(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type_cop;
+        fpr[r_type.rd] = @truncate(u32, gpr[r_type.rt]);
+        pc += 4;
+    }
+
+    inline fn instMthi(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        hi = gpr[r_type.rs];
+        pc += 4;
+    }
+
+    inline fn instMtlo(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        lo = gpr[r_type.rs];
+        pc += 4;
+    }
+
+    inline fn instMult(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        var result =
+            @as(i64, @bitCast(i32, @truncate(u32, gpr[r_type.rs]))) *% 
+            @as(i64, @bitCast(i32, @truncate(u32, gpr[r_type.rt])));
+        lo = @bitCast(u64, @as(i64, @truncate(i32, result)));
+        hi = @bitCast(u64, @as(i64, @truncate(i32, result >> 32)));
+        pc += 4;
+    }
+
+    inline fn instMultu(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        var result = @as(u64, @truncate(u32, gpr[r_type.rs])) *% @as(u64, @truncate(u32, gpr[r_type.rt]));
+        lo = @bitCast(u64, @as(i64, @bitCast(i32, @truncate(u32, result))));
+        hi = @bitCast(u64, @as(i64, @bitCast(i32, @truncate(u32, result >> 32))));
+        pc += 4;
+    }
+
+    inline fn instNor(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = ~(gpr[r_type.rs] | gpr[r_type.rt]);
+        pc += 4;
+    }
+
+    inline fn instOr(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = gpr[r_type.rs] | gpr[r_type.rt];
+        pc += 4;
+    }
+
+    fn instOri(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type;
+        gpr[i_type.rt] = gpr[i_type.rs] | @as(u64, i_type.immediate);
+        pc += 4;
+    }
+
+    fn instSb(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        IoMap.writeAligned(physical_address, @truncate(u8, gpr[i_type.rt]));
+        pc += 4;
+    }
+
+    fn instSd(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        if (physical_address & 0b111 != 0) {
+            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        IoMap.writeAligned(physical_address, gpr[i_type.rt]);
+        pc += 4;
+    }
+
+    fn instSdc1(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        if (physical_address & 0b111 != 0) {
+            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
+        IoMap.writeAligned(physical_address, fpr[i_type.rt]);
+        pc += 4;
+    }
+
+    // TODO: Implement SDL and SDR
+
+    fn instSh(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        if (physical_address & 0b1 != 0) {
+            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        IoMap.writeAligned(physical_address, @truncate(u16, gpr[i_type.rt]));
+        pc += 4;
+    }
+
+    inline fn instSll(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = @bitCast(u64, @as(i64, 
+            @bitCast(i32, @truncate(u32, gpr[r_type.rt]) << r_type.sa)));
+        pc += 4;
+    }
+
+    inline fn instSllv(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = @bitCast(u64, @as(i64, 
+            @bitCast(i32, @truncate(u32, gpr[r_type.rt]) << @truncate(u5, gpr[r_type.rs]))));
+        pc += 4;
+    }
+
+    inline fn instSlt(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = @boolToInt(@bitCast(i64, gpr[r_type.rs]) < @bitCast(i64, gpr[r_type.rt]));
+        pc += 4;
+    }
+
+    fn instSlti(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type;
+        gpr[i_type.rt] = @boolToInt(@bitCast(i64, gpr[i_type.rs]) < @bitCast(i16, i_type.immediate));
+        pc += 4;
+    }
+
+    fn instSltiu(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type;
+        gpr[i_type.rt] = @boolToInt(gpr[i_type.rs] < @bitCast(i16, i_type.immediate));
+        pc += 4;
+    }
+
+    inline fn instSltu(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = @boolToInt(gpr[r_type.rs] < gpr[r_type.rt]);
+        pc += 4;
+    }
+
+    inline fn instSra(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = @bitCast(u64, @as(i64, 
+            @bitCast(i32, @truncate(u32, gpr[r_type.rt])) >> r_type.sa));
+        pc += 4;
+    }
+
+    inline fn instSrav(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = @bitCast(u64, @as(i64, 
+            @bitCast(i32, @truncate(u32, gpr[r_type.rt])) >> @truncate(u5, gpr[r_type.rs])));
+        pc += 4;
+    }
+
+    inline fn instSrl(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = @bitCast(u64, @as(i64, @bitCast(i32,
+            @truncate(u32, gpr[r_type.rt]) >> r_type.sa)));
+        pc += 4;
+    }
+
+    inline fn instSrlv(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = @bitCast(u64, @as(i64, @bitCast(i32, 
+            @truncate(u32, gpr[r_type.rt]) >> @truncate(u5, gpr[r_type.rs]))));
+        pc += 4;
+    }
+
+    inline fn instSub(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        var rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
+        var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
+        var result: i32 = 0;
+        if (@subWithOverflow(i32, rs, rt, &result)) {
+            std.log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        gpr[r_type.rd] = @bitCast(u64, @as(i64, result));
+        pc += 4;
+    }
+
+    inline fn instSubu(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        var rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
+        var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
+        gpr[r_type.rd] = @bitCast(u64, @as(i64, rs -% rt));
+        pc += 4;
+    }
+
+    fn instSw(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        if (physical_address & 0b11 != 0) {
+            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        IoMap.writeAligned(physical_address, @truncate(u32, gpr[i_type.rt]));
+        pc += 4;
+    }
+
+    fn instSwc1(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type_mem;
+        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
+        if (physical_address & 0b11 != 0) {
+            std.log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+            pc += 4;
+            return;
+        }
+        // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
+        IoMap.writeAligned(physical_address, @truncate(u32, fpr[i_type.rt]));
+        pc += 4;
+    }
+
+    // TODO: Implement SWL and SWR
+
+    // TODO: Implement the TLB alongside the TLBP, TLBR, TLBWI, and TLBWR instructions
+
+    inline fn instXor(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        gpr[r_type.rd] = gpr[r_type.rs] ^ gpr[r_type.rt];
+        pc += 4;
+    }
+
+    fn instXori(inst: Instruction) CpuError!void {
+        const i_type = inst.data.i_type;
+        gpr[i_type.rt] = gpr[i_type.rs] ^ @as(u64, i_type.immediate);
         pc += 4;
     }
 
     fn instStub(inst: Instruction) CpuError!void {
-        std.log.warn("Unimplemented Instruction 0b{b}!", .{ inst.opcode });
+        std.log.warn("Unimplemented Instruction 0b{b} at address 0x{X}!", .{ inst.opcode, pc });
         return error.NotImplemented;
     }
 };
