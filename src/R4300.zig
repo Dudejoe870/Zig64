@@ -1,5 +1,6 @@
 const std = @import("std");
-const IoMap = @import("IoMap.zig");
+const io_map = @import("io_map.zig");
+const c = @import("c.zig");
 
 const log = std.log.scoped(.R4300);
 
@@ -13,8 +14,8 @@ pub var fcr31: u32 = 0;
 pub const FloatingPointRoundingMode = enum(u2) {
     nearest = 0b00,
     toward_zero = 0b01,
-    ceiling = 0b10,
-    floor = 0b11
+    positive_inf = 0b10,
+    negative_inf = 0b11
 };
 
 pub const FloatingPointControlRegister31 = packed struct(u32) {
@@ -68,7 +69,7 @@ pub var lo: u64 = 0;
 pub var ll_bit: bool = false;
 
 pub var cp0 = [_]u32{0} ** 32;
-const Cop0Register = enum(u8) {
+pub const Cop0Register = enum(u8) {
     index,
     random,
     entrylo0,
@@ -76,7 +77,8 @@ const Cop0Register = enum(u8) {
     context,
     pagemask,
     wired,
-    bad_vaddr = 8,
+    _reserved0,
+    bad_vaddr,
     count,
     entryhi,
     compare,
@@ -89,9 +91,17 @@ const Cop0Register = enum(u8) {
     watchlo,
     watchhi,
     xcontext,
-    taglo = 28,
+    _reserved1,
+    _reserved2,
+    _reserved3,
+    _reserved4,
+    _reserved5,
+    _reserved6,
+    _reserved7,
+    taglo,
     taghi,
-    errorepc
+    errorepc,
+    _reserved8
 };
 
 pub const InterruptBits = packed struct(u8) {
@@ -305,7 +315,7 @@ pub inline fn virtualToPhysical(vAddr: u32) u32 {
 }
 
 pub fn init(hle_pif: bool) void {
-    pc = IoMap.pif_boot_rom_base_addr;
+    pc = io_map.pif_boot_rom_base_addr;
 
     if (hle_pif) {
         @panic("PIF HLE not implemented!");
@@ -316,14 +326,22 @@ pub fn step() CpuError!void {
     gpr[0] = 0;
 
     var inst = InstructionBits { 
-        .bits = IoMap.readAligned(u32, pc & 0x1FFFFFFF) 
+        .bits = io_map.readAligned(u32, pc & 0x1FFFFFFF) 
     };
 
+    var original_mode = c.fegetround();
+    _ = c.fesetround(switch (getFcr31Flags().rounding_mode) {
+        .nearest => c.FE_TONEAREST,
+        .toward_zero => c.FE_TOWARDZERO,
+        .positive_inf => c.FE_UPWARD,
+        .negative_inf => c.FE_DOWNWARD
+    });
     if (inst.bits != 0) {
         try interpreter.opcode_lookup[inst.instruction.opcode](inst.instruction);
     } else {
         pc += 4;
     }
+    _ = c.fesetround(original_mode);
 
     // Handle jumps and branches.
     if ((jump_target != null or branch_target != null) and !is_delay_slot) {
@@ -1152,7 +1170,7 @@ const interpreter = struct {
     fn instLb(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        var result = IoMap.readAligned(u8, physical_address);
+        var result = io_map.readAligned(u8, physical_address);
         gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i8, result)));
         pc += 4;
     }
@@ -1160,7 +1178,7 @@ const interpreter = struct {
     fn instLbu(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        var result = IoMap.readAligned(u8, physical_address);
+        var result = io_map.readAligned(u8, physical_address);
         gpr[i_type.rt] = result;
         pc += 4;
     }
@@ -1173,7 +1191,7 @@ const interpreter = struct {
             pc += 4;
             return;
         }
-        gpr[i_type.rt] = IoMap.readAligned(u64, physical_address);
+        gpr[i_type.rt] = io_map.readAligned(u64, physical_address);
         pc += 4;
     }
 
@@ -1186,7 +1204,7 @@ const interpreter = struct {
             return;
         }
         // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
-        fpr[i_type.rt] = IoMap.readAligned(u64, physical_address);
+        fpr[i_type.rt] = io_map.readAligned(u64, physical_address);
         pc += 4;
     }
 
@@ -1200,7 +1218,7 @@ const interpreter = struct {
             pc += 4;
             return;
         }
-        gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i16, IoMap.readAligned(u16, physical_address))));
+        gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i16, io_map.readAligned(u16, physical_address))));
         pc += 4;
     }
 
@@ -1212,7 +1230,7 @@ const interpreter = struct {
             pc += 4;
             return;
         }
-        gpr[i_type.rt] = IoMap.readAligned(u16, physical_address);
+        gpr[i_type.rt] = io_map.readAligned(u16, physical_address);
         pc += 4;
     }
 
@@ -1230,7 +1248,7 @@ const interpreter = struct {
             pc += 4;
             return;
         }
-        gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i32, IoMap.readAligned(u32, physical_address))));
+        gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i32, io_map.readAligned(u32, physical_address))));
         pc += 4;
     }
 
@@ -1243,7 +1261,7 @@ const interpreter = struct {
             return;
         }
         // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
-        fpr[i_type.rt] = IoMap.readAligned(u32, physical_address);
+        fpr[i_type.rt] = io_map.readAligned(u32, physical_address);
         pc += 4;
     }
 
@@ -1257,7 +1275,7 @@ const interpreter = struct {
             pc += 4;
             return;
         }
-        gpr[i_type.rt] = IoMap.readAligned(u32, physical_address);
+        gpr[i_type.rt] = io_map.readAligned(u32, physical_address);
         pc += 4;
     }
 
@@ -1348,7 +1366,7 @@ const interpreter = struct {
     fn instSb(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        IoMap.writeAligned(physical_address, @truncate(u8, gpr[i_type.rt]));
+        io_map.writeAligned(physical_address, @truncate(u8, gpr[i_type.rt]));
         pc += 4;
     }
 
@@ -1360,7 +1378,7 @@ const interpreter = struct {
             pc += 4;
             return;
         }
-        IoMap.writeAligned(physical_address, gpr[i_type.rt]);
+        io_map.writeAligned(physical_address, gpr[i_type.rt]);
         pc += 4;
     }
 
@@ -1373,7 +1391,7 @@ const interpreter = struct {
             return;
         }
         // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
-        IoMap.writeAligned(physical_address, fpr[i_type.rt]);
+        io_map.writeAligned(physical_address, fpr[i_type.rt]);
         pc += 4;
     }
 
@@ -1387,7 +1405,7 @@ const interpreter = struct {
             pc += 4;
             return;
         }
-        IoMap.writeAligned(physical_address, @truncate(u16, gpr[i_type.rt]));
+        io_map.writeAligned(physical_address, @truncate(u16, gpr[i_type.rt]));
         pc += 4;
     }
 
@@ -1487,7 +1505,7 @@ const interpreter = struct {
             pc += 4;
             return;
         }
-        IoMap.writeAligned(physical_address, @truncate(u32, gpr[i_type.rt]));
+        io_map.writeAligned(physical_address, @truncate(u32, gpr[i_type.rt]));
         pc += 4;
     }
 
@@ -1500,7 +1518,7 @@ const interpreter = struct {
             return;
         }
         // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
-        IoMap.writeAligned(physical_address, @truncate(u32, fpr[i_type.rt]));
+        io_map.writeAligned(physical_address, @truncate(u32, fpr[i_type.rt]));
         pc += 4;
     }
 

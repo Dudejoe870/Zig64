@@ -1,133 +1,171 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-fn MemRange(comptime size_in_bytes: u32, comptime read_event: ?fn(u32) void, comptime write_event: ?fn(u32, u32, u32) bool) type {
-    return struct {
-        const Self = @This();
+const MemRange = struct {
+    const Self = @This();
 
-        buf: [size_in_bytes]u8 = [_]u8{0} ** size_in_bytes,
+    buf: []align(4) u8,
+    allocator: std.mem.Allocator,
 
-        inline fn writeWord(self: *Self, offset: u32, value: u32) void {
-            var dst_ptr = @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
-            dst_ptr.* = value;
-        }
+    write_event: ?*const fn(offset: u32, value: u32, mask: u32) bool = null,
+    read_event: ?*const fn(offset: u32) void = null,
 
-        inline fn readWord(self: *Self, offset: u32) u32 {
-            var dst_ptr = @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
-            return dst_ptr.*;
-        }
+    fn readOnlyWriteEvent(_: u32, _: u32, _: u32) bool {
+        return false;
+    }
 
-        // The way this works is all reads and writes are only done to the 32-bit boundary, 
-        // and there are no byteswaps involved. The way this is accomplished is using masking.
-        // By calculating the mask we need based on the 32-bit boundary, we can simplify IO register events, 
-        // and store everything in the CPUs native endian. (This is based off of mupen64plus's memory handling)
-        inline fn writeWordMasked(self: *Self, offset: u32, value: u32, mask: u32) void {
-            var dst_ptr = @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
-            dst_ptr.* = (dst_ptr.* & ~mask) | (value & mask);
-        }
+    pub fn init(allocator: std.mem.Allocator, size: usize) !Self {
+        return Self {
+            .buf = try allocator.alignedAlloc(u8, 4, size),
+            .allocator = allocator
+        };
+    }
 
-        pub fn writeFromFile(self: *Self, file: std.fs.File) !usize {
-            if (builtin.target.cpu.arch.endian() == .Little) {
-                var index: usize = 0;
-                var buffer_left: usize = self.buf.len;
-                while (buffer_left >= 4) {
-                    var u32_buffer: [4]u8 = undefined;
-                    const amt = try file.read(u32_buffer[0..]);
-                    if (amt == 0) break;
+    pub fn initWithEvents(
+        allocator: std.mem.Allocator, size: usize, 
+        write_event: ?*const fn(u32, u32, u32) bool, read_event: ?*const fn(u32) void
+    ) !Self {
+        return Self {
+            .buf = try allocator.alignedAlloc(u8, 4, size),
+            .allocator = allocator,
+            .write_event = write_event,
+            .read_event = read_event
+        };
+    }
 
-                    // Swap the Big-Endian bytes around.
-                    var i: usize = 0;
-                    while (i < amt) {
-                        self.buf[index + ((amt-1) - i)] = u32_buffer[i];
-                        i += 1;
-                    }
-                    index += amt;
-                    buffer_left -= amt;
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.buf);
+    }
+
+    pub fn clearToZero(self: *Self) void {
+        std.mem.set(u8, self.buf, 0);
+    }
+
+    inline fn writeWord(self: *Self, offset: u32, value: u32) void {
+        var dst_ptr = @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
+        dst_ptr.* = value;
+    }
+
+    inline fn readWord(self: *Self, offset: u32) u32 {
+        var dst_ptr = @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
+        return dst_ptr.*;
+    }
+
+    // The way this works is all reads and writes are only done to the 32-bit boundary, 
+    // and there are no byteswaps involved. The way this is accomplished is using masking.
+    // By calculating the mask we need based on the 32-bit boundary, we can simplify IO register events, 
+    // and store everything in the CPUs native endian. (This is based off of mupen64plus's memory handling)
+    inline fn writeWordMasked(self: *Self, offset: u32, value: u32, mask: u32) void {
+        var dst_ptr = @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
+        dst_ptr.* = (dst_ptr.* & ~mask) | (value & mask);
+    }
+
+    pub fn writeFromFile(self: *Self, file: std.fs.File) !usize {
+        if (builtin.target.cpu.arch.endian() == .Little) {
+            var index: usize = 0;
+            var buffer_left: usize = self.buf.len;
+            while (buffer_left >= 4) {
+                var u32_buffer: [4]u8 = undefined;
+                const amt = try file.read(u32_buffer[0..]);
+                if (amt == 0) break;
+
+                // Swap the Big-Endian bytes around.
+                var i: usize = 0;
+                while (i < amt) {
+                    self.buf[index + ((amt-1) - i)] = u32_buffer[i];
+                    i += 1;
                 }
-                return index;
-            } else {
-                return file.readAll(&self.buf);
+                index += amt;
+                buffer_left -= amt;
             }
+            return index;
+        } else {
+            return file.readAll(self.buf);
         }
+    }
 
-        pub inline fn writeAligned(self: *Self, offset: u32, value: anytype) void {
-            var should_write: bool = true;
-            var aligned_offset: u32 = offset;
+    pub inline fn writeAligned(self: *Self, offset: u32, value: anytype) void {
+        var should_write: bool = true;
+        var aligned_offset: u32 = offset;
 
-            const T = @TypeOf(value);
+        const T = @TypeOf(value);
 
-            if (T == u32) {
-                aligned_offset &= ~@as(u32, 0b11);
+        if (T == u32) {
+            aligned_offset &= ~@as(u32, 0b11);
 
-                if (write_event) |event| should_write = event(aligned_offset, value, 0xFFFFFFFF);
-                if (should_write) self.writeWord(aligned_offset, @bitCast(u32, value));
-            } else if (T == u64) {
-                aligned_offset &= ~@as(u32, 0b111);
+            if (self.write_event) |event| should_write = event(aligned_offset, value, 0xFFFFFFFF);
+            if (should_write) self.writeWord(aligned_offset, @bitCast(u32, value));
+        } else if (T == u64) {
+            aligned_offset &= ~@as(u32, 0b111);
 
-                self.writeAligned(aligned_offset, @truncate(u32, value >> 32));
-                self.writeAligned(aligned_offset + 4, @truncate(u32, value));
-            } else if (T == u8 or T == u16) {
-                aligned_offset &= ~@as(u32, 0b11);
+            self.writeAligned(aligned_offset, @truncate(u32, value >> 32));
+            self.writeAligned(aligned_offset + 4, @truncate(u32, value));
+        } else if (T == u8 or T == u16) {
+            aligned_offset &= ~@as(u32, 0b11);
 
-                var shift: u5 = undefined;
-                if (T == u16) {
-                    shift = ((@truncate(u5, offset) & 2) ^ 2) << 3;
-                } else if (T == u8) {
-                    shift = ((@truncate(u5, offset) & 3) ^ 3) << 3;
-                }
-
-                const value_mask: u32 = (1 << @typeInfo(T).Int.bits) - 1;
-
-                var value_to_write: u32 = @as(u32, value) << shift;
-                var mask: u32 = value_mask << shift;
-                
-                if (write_event) |event| should_write = event(aligned_offset, value_to_write, mask);
-                if (should_write) self.writeWordMasked(aligned_offset, value_to_write, mask);
-            } else {
-                @compileError("Invalid type for IO write!");
+            var shift: u5 = undefined;
+            if (T == u16) {
+                shift = ((@truncate(u5, offset) & 2) ^ 2) << 3;
+            } else if (T == u8) {
+                shift = ((@truncate(u5, offset) & 3) ^ 3) << 3;
             }
+
+            const value_mask: u32 = (1 << @typeInfo(T).Int.bits) - 1;
+
+            var value_to_write: u32 = @as(u32, value) << shift;
+            var mask: u32 = value_mask << shift;
+            
+            if (self.write_event) |event| should_write = event(aligned_offset, value_to_write, mask);
+            if (should_write) self.writeWordMasked(aligned_offset, value_to_write, mask);
+        } else {
+            @compileError("Invalid type for IO write!");
         }
+    }
 
-        pub inline fn readAligned(self: *Self, comptime T: type, offset: u32) T {
-            var aligned_offset: u32 = offset;
+    pub inline fn readAligned(self: *Self, comptime T: type, offset: u32) T {
+        var aligned_offset: u32 = offset;
 
-            if (T == u32) {
-                aligned_offset &= ~@as(u32, 0b11);
+        if (T == u32) {
+            aligned_offset &= ~@as(u32, 0b11);
 
-                if (read_event) |event| event(aligned_offset);
-                return self.readWord(aligned_offset);
-            } else if (T == u64) {
-                aligned_offset &= ~@as(u32, 0b111);
-                return self.readAligned(u32, aligned_offset + 4) | (@intCast(u64, self.readAligned(u32, aligned_offset)) << 32);
-            } else if (T == u8 or T == u16) {
-                var shift: u5 = undefined;
-                if (T == u16) {
-                    aligned_offset &= ~@as(u32, 0b1);
-                    shift = ((@truncate(u5, aligned_offset) & 2) ^ 2) << 3;
-                } else if (T == u8) {
-                    shift = ((@truncate(u5, aligned_offset) & 3) ^ 3) << 3;
-                }
-
-                aligned_offset &= ~@as(u32, 0b11);
-                var result: u32 = self.readAligned(u32, aligned_offset);
-
-                if (read_event) |event| event(aligned_offset);
-                return @truncate(T, result >> shift);
-            } else {
-                @compileError("Invalid type for IO read!");
+            if (self.read_event) |event| event(aligned_offset);
+            return self.readWord(aligned_offset);
+        } else if (T == u64) {
+            aligned_offset &= ~@as(u32, 0b111);
+            return self.readAligned(u32, aligned_offset + 4) | (@as(u64, self.readAligned(u32, aligned_offset)) << 32);
+        } else if (T == u8 or T == u16) {
+            var shift: u5 = undefined;
+            if (T == u16) {
+                aligned_offset &= ~@as(u32, 0b1);
+                shift = ((@truncate(u5, aligned_offset) & 2) ^ 2) << 3;
+            } else if (T == u8) {
+                shift = ((@truncate(u5, aligned_offset) & 3) ^ 3) << 3;
             }
+
+            aligned_offset &= ~@as(u32, 0b11);
+            var result: u32 = self.readAligned(u32, aligned_offset);
+
+            if (self.read_event) |event| event(aligned_offset);
+            return @truncate(T, result >> shift);
+        } else {
+            @compileError("Invalid type for IO read!");
         }
-    };
-}
+    }
+};
+
+var arena: std.heap.ArenaAllocator = undefined;
+pub const MemoryError = error {
+    InvalidPifBootrom
+};
 
 pub const rdram = struct {
     pub const dram_size = 0x800000;
-    pub var dram = MemRange(0x800000, null, null) { };
+    pub var dram: MemRange = undefined;
 
     pub const rdram_module_count: u8 = dram_size / 0x200000;
     pub const rdram_max_module_count: u8 = 8;
     pub const rdram_module_reg_count: u8 = 10;
-    pub var reg_range = MemRange(@as(u32, rdram_max_module_count)*rdram_module_reg_count*@sizeOf(u32), null, null) { };
+    pub var reg_range: MemRange = undefined;
 
     pub const RegRangeOffset = enum(u8) {
         rdram_config_reg = 0x00,
@@ -147,7 +185,10 @@ pub const rdram = struct {
             &reg_range.buf[(@as(u32, module) * (@as(u32, rdram_module_reg_count)*@sizeOf(u32))) + @enumToInt(offset)]);
     }
 
-    fn init() void {
+    fn init() !void {
+        dram = try MemRange.init(arena.allocator(), dram_size);
+        reg_range = try MemRange.init(arena.allocator(), @as(u32, rdram_max_module_count)*rdram_module_reg_count*@sizeOf(u32));
+
         // Initialize RDRAM registers. (values from mupen64plus)
         std.debug.assert(rdram_module_count <= rdram_max_module_count);
         var i: u8 = 0;
@@ -166,10 +207,10 @@ pub const rdram = struct {
 
 pub const rcp = struct {
     pub const rsp = struct {
-        pub var dmem = MemRange(0x1000, null, null) { };
-        pub var imem = MemRange(0x1000, null, null) { };
+        pub var dmem: MemRange = undefined;
+        pub var imem: MemRange = undefined;
 
-        pub var reg_range_0 = MemRange(8*@sizeOf(u32), null, null) { };
+        pub var reg_range_0: MemRange = undefined;
         pub const RegRange0Offset = enum(u8) {
             sp_mem_addr_reg = 0x00,
             sp_dram_addr_reg = 0x04,
@@ -181,15 +222,25 @@ pub const rcp = struct {
             sp_semaphore_reg = 0x1c
         };
 
-        pub var reg_range_1 = MemRange(2*@sizeOf(u32), null, null) { };
+        pub var reg_range_1: MemRange = undefined;
         pub const RegRange1Offset = enum(u8) {
             sp_pc_reg = 0x00,
             sp_ibist_reg = 0x04
         };
+
+        fn init() !void {
+            dmem = try MemRange.init(arena.allocator(), 0x1000);
+            imem = try MemRange.init(arena.allocator(), 0x1000);
+
+            reg_range_0 = try MemRange.init(arena.allocator(), 8*@sizeOf(u32));
+            reg_range_0.clearToZero();
+            reg_range_1 = try MemRange.init(arena.allocator(), 2*@sizeOf(u32));
+            reg_range_1.clearToZero();
+        }
     };
 
     pub const rdp = struct {
-        pub var cmd = MemRange(8*@sizeOf(u32), null, null) { };
+        pub var cmd: MemRange = undefined;
         pub const CmdRangeOffset = enum(u8) {
             dpc_start_reg = 0x00,
             dpc_end_reg = 0x04,
@@ -201,27 +252,39 @@ pub const rcp = struct {
             dpc_tmem_reg = 0x1C
         };
 
-        pub var span = MemRange(4*@sizeOf(u32), null, null) { };
+        pub var span: MemRange = undefined;
         pub const SpanRangeOffset = enum(u8) {
             dps_tbist_reg = 0x00,
             dps_test_mode_reg = 0x04,
             dps_buftest_addr_reg = 0x08,
             dps_buftest_data_reg = 0x0C
         };
+
+        fn init() !void {
+            cmd = try MemRange.init(arena.allocator(), 8*@sizeOf(u32));
+            cmd.clearToZero();
+            span = try MemRange.init(arena.allocator(), 4*@sizeOf(u32));
+            span.clearToZero();
+        }
     };
 
     pub const mi = struct {
-        pub var reg_range = MemRange(4*@sizeOf(u32), null, null) { };
+        pub var reg_range: MemRange = undefined;
         pub const RegRangeOffset = enum(u8) {
             mi_init_mode_reg = 0x00,
             mi_version_reg = 0x04,
             mi_intr_reg = 0x08,
             mi_intr_mask_reg = 0x0C
         };
+
+        fn init() !void {
+            reg_range = try MemRange.init(arena.allocator(), 4*@sizeOf(u32));
+            reg_range.clearToZero();
+        }
     };
 
     pub const vi = struct {
-        pub var reg_range = MemRange(14*@sizeOf(u32), null, null) { };
+        pub var reg_range: MemRange = undefined;
         pub const RegRangeOffset = enum(u8) {
             vi_status_reg = 0x00,
             vi_origin_reg = 0x04,
@@ -238,10 +301,15 @@ pub const rcp = struct {
             vi_x_scale_reg = 0x30,
             vi_y_scale_reg = 0x34
         };
+
+        fn init() !void {
+            reg_range = try MemRange.init(arena.allocator(), 14*@sizeOf(u32));
+            reg_range.clearToZero();
+        }
     };
 
     pub const ai = struct {
-        pub var reg_range = MemRange(6*@sizeOf(u32), null, null) { };
+        pub var reg_range: MemRange = undefined;
         pub const RegRangeOffset = enum(u8) {
             ai_dram_addr_reg = 0x00,
             ai_len_reg = 0x04,
@@ -250,10 +318,15 @@ pub const rcp = struct {
             ai_dacrate_reg = 0x10,
             ai_bitrate_reg = 0x14
         };
+
+        fn init() !void {
+            reg_range = try MemRange.init(arena.allocator(), 6*@sizeOf(u32));
+            reg_range.clearToZero();
+        }
     };
 
     pub const pi = struct {
-        pub var reg_range = MemRange(13*@sizeOf(u32), null, null) { };
+        pub var reg_range: MemRange = undefined;
         pub const RegRangeOffset = enum(u8) {
             pi_dram_addr_reg = 0x00,
             pi_cart_addr_reg = 0x04,
@@ -271,10 +344,15 @@ pub const rcp = struct {
             pi_bsd_dom2_pgs_reg = 0x2C,
             pi_bsd_dom2_rls_reg = 0x30,
         };
+
+        fn init() !void {
+            reg_range = try MemRange.init(arena.allocator(), 13*@sizeOf(u32));
+            reg_range.clearToZero();
+        }
     };
 
     pub const ri = struct {
-        pub var reg_range = MemRange(8*@sizeOf(u32), null, null) { };
+        pub var reg_range: MemRange = undefined;
         pub const RegRangeOffset = enum(u8) {
             ri_mode_reg = 0x00,
             ri_config_reg = 0x04,
@@ -285,36 +363,77 @@ pub const rcp = struct {
             ri_rerror_reg = 0x18,
             ri_werror_reg = 0x1C
         };
+
+        fn init() !void {
+            reg_range = try MemRange.init(arena.allocator(), 8*@sizeOf(u32));
+            reg_range.clearToZero();
+        }
     };
 
     pub const si = struct {
-        pub var reg_range = MemRange(7*@sizeOf(u32), null, null) { };
+        pub var reg_range: MemRange = undefined;
         pub const RegRangeOffset = enum(u8) {
             si_dram_addr_reg = 0x00,
             si_pif_addr_rd64b_reg = 0x04,
             si_pif_addr_wr64b_reg = 0x10,
             si_status_reg = 0x18
         };
+
+        fn init() !void {
+            reg_range = try MemRange.init(arena.allocator(), 4*@sizeOf(u32));
+            reg_range.clearToZero();
+        }
     };
+
+    fn init() !void {
+        try rsp.init();
+        try rdp.init();
+        
+        try mi.init();
+        try vi.init();
+        try ai.init();
+        try pi.init();
+        try ri.init();
+        try si.init();
+    }
 };
 
 pub const cart = struct {
-    // My current design sort of accidentally avoids dynamic memory allocation 
-    // (could mean that if I made the other parts of the emulator have some amount of abstraction, 
-    // this emulator could run on bare metal),
-    // so we just statically allocate the biggest size a cart could *technically* be. 
-    // (More likely to be max 64MB, but 255MB is a fairly small size to allocate in RAM anyway)
     pub const max_cart_size = 255459327;
-    pub var rom = MemRange(max_cart_size, null, null) { };
+    pub var rom: MemRange = undefined;
+
+    pub fn init(rom_file: std.fs.File) !void {
+        var size = std.math.min(max_cart_size, try rom_file.getEndPos());
+        rom = try MemRange.initWithEvents(arena.allocator(), size, MemRange.readOnlyWriteEvent, null);
+        _ = try rom.writeFromFile(rom_file);
+    }
 };
 
 pub const pif = struct {
-    pub var boot_rom = MemRange(2048, null, null) { };
-    pub var ram = MemRange(64, null, null) { };
+    pub var boot_rom: MemRange = undefined;
+    pub var ram: MemRange = undefined;
+
+    pub fn init(boot_rom_file: ?std.fs.File) !void {
+        boot_rom = try MemRange.initWithEvents(arena.allocator(), 2048, MemRange.readOnlyWriteEvent, null);
+        if (boot_rom_file) |file| {
+            if (try file.getEndPos() < 2048) {
+                return error.InvalidPifBootrom;
+            }
+            _ = try boot_rom.writeFromFile(file);
+        }
+        ram = try MemRange.init(arena.allocator(), 64);
+    }
 };
 
-pub fn init() void {
-    rdram.init();
+pub fn init() !void {
+    arena = std.heap.ArenaAllocator.init(std.heap.raw_c_allocator);
+
+    try rdram.init();
+    try rcp.init();
+}
+
+pub fn deinit() void {
+    arena.deinit();
 }
 
 // TESTS
@@ -343,7 +462,15 @@ test "Memory Range Read/Writes" {
             return true;
         }
 
-        var test_range = MemRange(4*32, readEvent, writeEvent) { };
+        var test_range: MemRange = undefined;
+
+        fn init() !void {
+            test_range = try MemRange.initWithEvents(std.testing.allocator, 4*32, writeEvent, readEvent);
+        }
+
+        fn deinit() void {
+            test_range.deinit();
+        }
 
         fn testEventWorked() !void {
             try std.testing.expect(event_worked_properly);
@@ -387,6 +514,9 @@ test "Memory Range Read/Writes" {
         }
     };
 
+    try S.init();
     try S.testWrite(u32, first_offset, first_write);
     try S.testWrite(u64, second_offset, second_write);
+
+    S.deinit();
 }

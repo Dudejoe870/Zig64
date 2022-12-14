@@ -25,6 +25,7 @@ pub const pif_boot_rom_base_addr: u32 = 0x1fc00000;
 pub const pif_ram_base_addr: u32 = 0x1fc007c0;
 
 // Everything is compile-time evaluated into individual checks at run-time.
+// TODO: Replace this with binary search.
 fn MemoryEntry(comptime T: type) type {
     return struct {
         memory: *T,
