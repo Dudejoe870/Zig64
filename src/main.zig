@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const system = @import("system.zig");
 const ui = @import("ui.zig");
@@ -7,12 +8,21 @@ const c = @import("c.zig");
 const glfw = @import("glfw");
 const gl = @import("gl");
 
+const dummy_stack_protector = @import("dummy_stack_protector.zig");
+
 fn glGetProcAddress(p: glfw.GLProc, proc: [:0]const u8) ?gl.FunctionPointer {
     _ = p;
     return glfw.getProcAddress(proc);
 }
 
 pub fn main() !u8 {
+    // These symbols are required to be defined by GLFW 
+    // in release-fast mode for some reason.
+    if (builtin.mode == std.builtin.Mode.ReleaseFast) {
+        _ = dummy_stack_protector.__stack_chk_fail;
+        _ = dummy_stack_protector.__stack_chk_guard;
+    }
+
     var arena = std.heap.ArenaAllocator.init(std.heap.raw_c_allocator);
     defer arena.deinit();
 
@@ -23,10 +33,7 @@ pub fn main() !u8 {
         std.log.err("Expected first argument to be rom to run", .{ });
         return error.InvalidArgs;
     };
-    const pif = arg_it.next() orelse {
-        std.log.err("Expected first argument to be PIF rom.", .{ });
-        return error.InvalidArgs;
-    };
+    const pif = arg_it.next();
 
     try runEmulator(pif, rom);
     return 0;

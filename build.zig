@@ -31,7 +31,7 @@ pub fn build(b: *Builder) !void {
     exe.addPackagePath("gl", "opengl/gl_4v6.zig");
 
     exe.addPackage(glfw.pkg);
-    try glfw.link(b, exe, .{ });
+    try glfw.link(b, exe, .{ .opengl = true });
 
     exe.setTarget(target);
     exe.setBuildMode(mode);

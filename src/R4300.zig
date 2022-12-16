@@ -1,8 +1,9 @@
 const std = @import("std");
 const io_map = @import("io_map.zig");
+const memory = @import("memory.zig");
 const c = @import("c.zig");
 
-const log = std.log.scoped(.R4300);
+const log = std.log.scoped(.r4300);
 
 pub var gpr = [_]u64{0} ** 32;
 
@@ -156,6 +157,21 @@ pub fn getStatusFlags() *Cop0StatusRegister {
     return @ptrCast(*Cop0StatusRegister, &cp0[@enumToInt(Cop0Register.status)]);
 }
 
+pub const Cop0ConfigRegister = packed struct(u32) {
+    kseg0_flags: u3,
+    cu: bool,
+    _data0: u11,
+    big_endian_enable: bool,
+    _data1: u8,
+    transfer_data_pattern: u4,
+    operating_frequency_ratio: u3,
+    _always_zero: bool
+};
+
+pub fn getConfigFlags() *Cop0ConfigRegister {
+    return @ptrCast(*Cop0ConfigRegister, &cp0[@enumToInt(Cop0Register.config)]);
+}
+
 pub const InstructionBits = packed union {
     instruction: Instruction,
     bits: u32
@@ -202,6 +218,8 @@ pub const Instruction = packed struct(u32) {
         sltu   = 0b101011,
         sra    = 0b000011,
         srav   = 0b000111,
+        srl    = 0b000010,
+        srlv   = 0b000110,
         sub    = 0b100010,
         subu   = 0b100011,
         xor    = 0b100110
@@ -301,6 +319,7 @@ pub const Instruction = packed struct(u32) {
 pub var pc: u32 = 0;
 var branch_target: ?i32 = null;
 var jump_target: ?u32 = null;
+var jump_reg_target: ?u32 = null;
 var is_delay_slot: bool = false;
 
 pub const CpuError = error {
@@ -315,18 +334,104 @@ pub inline fn virtualToPhysical(vAddr: u32) u32 {
 }
 
 pub fn init(hle_pif: bool) void {
-    pc = io_map.pif_boot_rom_base_addr;
+    getConfigFlags().big_endian_enable = true;
 
     if (hle_pif) {
-        @panic("PIF HLE not implemented!");
+        getStatusFlags().coprocessor_enable.bits = 0b0011; // Enable Coprocessor 0 and 1.
+        getStatusFlags().floating_point_registers_enable = true; // Enable all floating-point registers.
+
+        getConfigFlags().kseg0_flags = 0b011; // Sets kseg0 to be uncached.
+        getConfigFlags().cu = false; // An unused bit that can be written to and read from.
+        getConfigFlags().big_endian_enable = true; // Enable Big-endian (also already the default at a cold reset)
+
+        // halt the RSP, clear interrupt
+        memory.rcp.rsp.reg_range_0.writeAligned(
+            @enumToInt(memory.rcp.rsp.RegRange0Offset.sp_status_reg), @as(u32, 0b1010)
+        );
+
+        // reset the PI, clear interrupt
+        memory.rcp.pi.reg_range.writeAligned(
+            @enumToInt(memory.rcp.pi.RegRangeOffset.pi_status_reg), @as(u32, 0b11)
+        );
+        
+        memory.rcp.vi.reg_range.writeAligned(
+            @enumToInt(memory.rcp.vi.RegRangeOffset.vi_intr_reg), @as(u32, 1023)
+        );
+        memory.rcp.vi.reg_range.writeAligned(
+            @enumToInt(memory.rcp.vi.RegRangeOffset.vi_current_reg), @as(u32, 0)
+        );
+        memory.rcp.vi.reg_range.writeAligned(
+            @enumToInt(memory.rcp.vi.RegRangeOffset.vi_h_start_reg), @as(u32, 0)
+        );
+
+        memory.rcp.ai.reg_range.writeAligned(
+            @enumToInt(memory.rcp.ai.RegRangeOffset.ai_dram_addr_reg), @as(u32, 0)
+        );
+        memory.rcp.ai.reg_range.writeAligned(
+            @enumToInt(memory.rcp.ai.RegRangeOffset.ai_len_reg), @as(u32, 0)
+        );
+
+        // Parse pif24
+        var pif24 = memory.pif.ram.readAligned(u32, 0x24);
+        var rom_type = (pif24 >> 19) & 1;
+        var s7 = (pif24 >> 18) & 1;
+        var reset_type = (pif24 >> 17) & 1;
+        var seed = (pif24 >> 8) & 0xFF;
+        var tv_type: u32 = 1; // NTSC (TODO: Make this configurable)
+        gpr[19] = rom_type;
+        gpr[20] = tv_type;
+        gpr[21] = reset_type;
+        gpr[22] = seed;
+        gpr[23] = s7;
+        
+        // Write the cart timing configuration
+        var bsd_dom1_config = memory.cart.rom.readAligned(u32, 0);
+        memory.rcp.pi.reg_range.writeAligned(
+            @enumToInt(memory.rcp.pi.RegRangeOffset.pi_bsd_dom1_lat_reg), bsd_dom1_config & 0xFF
+        );
+        memory.rcp.pi.reg_range.writeAligned(
+            @enumToInt(memory.rcp.pi.RegRangeOffset.pi_bsd_dom1_pwd_reg), (bsd_dom1_config >> 8) & 0xFF
+        );
+        memory.rcp.pi.reg_range.writeAligned(
+            @enumToInt(memory.rcp.pi.RegRangeOffset.pi_bsd_dom1_pgs_reg), (bsd_dom1_config >> 16) & 0x0F
+        );
+        memory.rcp.pi.reg_range.writeAligned(
+            @enumToInt(memory.rcp.pi.RegRangeOffset.pi_bsd_dom1_rls_reg), (bsd_dom1_config >> 20) & 0b11
+        );
+
+        // Copy IPL3 bootcode to RSP DMEM
+        std.mem.copy(u8, memory.rcp.rsp.dmem.buf[0x40..], memory.cart.rom.buf[0x40..0x1000]);
+
+        // Required by CIC x105
+        memory.rcp.rsp.imem.writeAligned(0x00, @as(u32, 0x3c0dbfc0));
+        memory.rcp.rsp.imem.writeAligned(0x04, @as(u32, 0x8da807fc));
+        memory.rcp.rsp.imem.writeAligned(0x08, @as(u32, 0x25ad07c0));
+        memory.rcp.rsp.imem.writeAligned(0x0C, @as(u32, 0x31080080));
+        memory.rcp.rsp.imem.writeAligned(0x10, @as(u32, 0x5500fffc));
+        memory.rcp.rsp.imem.writeAligned(0x14, @as(u32, 0x3c0dbfc0));
+        memory.rcp.rsp.imem.writeAligned(0x18, @as(u32, 0x8da80024));
+        memory.rcp.rsp.imem.writeAligned(0x1C, @as(u32, 0x3c0bb000));
+        gpr[11] = 0xFFFFFFFFA0000000 + @as(u64, io_map.sp_dmem_base_addr) + 0x40;
+        gpr[29] = 0xFFFFFFFFA0000000 + @as(u64, io_map.sp_imem_base_addr) + 0xff0;
+        gpr[31] = 0xFFFFFFFFA0000000 + @as(u64, io_map.sp_imem_base_addr) + 0x550;
+
+        pc = 0xA0000000 + io_map.sp_dmem_base_addr + 0x40;
+    } else {
+        pc = io_map.pif_boot_rom_base_addr;
     }
 }
 
 pub fn step() CpuError!void {
     gpr[0] = 0;
+    getConfigFlags().operating_frequency_ratio = 0; // I don't know what this is supposed to be.
+    getConfigFlags()._data0 = 0b11001000110;
+    getConfigFlags()._data1 = 0b00000110;
+    getConfigFlags()._always_zero = false;
 
+    var instruction_ptr = io_map.getWordPtr(pc & 0x1FFFFFFF);
+    std.debug.assert(instruction_ptr != null);
     var inst = InstructionBits { 
-        .bits = io_map.readAligned(u32, pc & 0x1FFFFFFF) 
+        .bits = instruction_ptr.?.*
     };
 
     var original_mode = c.fegetround();
@@ -344,11 +449,15 @@ pub fn step() CpuError!void {
     _ = c.fesetround(original_mode);
 
     // Handle jumps and branches.
-    if ((jump_target != null or branch_target != null) and !is_delay_slot) {
+    if ((jump_target != null or branch_target != null or jump_reg_target != null) and !is_delay_slot) {
         is_delay_slot = true;
     } else if (jump_target != null and is_delay_slot) {
         pc = (pc & 0xF0000000) | jump_target.?;
         jump_target = null;
+        is_delay_slot = false;
+    } else if (jump_reg_target != null and is_delay_slot) {
+        pc = jump_reg_target.?;
+        jump_reg_target = null;
         is_delay_slot = false;
     } else if (branch_target != null and is_delay_slot) {
         pc = (pc - 4) +% @bitCast(u32, branch_target.?);
@@ -417,7 +526,7 @@ const interpreter = struct {
     }
 
     inline fn jumpReg(reg: u5) void {
-        jump_target = @truncate(u32, gpr[reg]);
+        jump_reg_target = @truncate(u32, gpr[reg]);
     }
 
     inline fn linkReg(reg: u5) void {
@@ -550,6 +659,12 @@ const interpreter = struct {
             return;
         } else if (r_type.function == Instruction.SpecialFunction.srav) {
             try instSrav(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.srl) {
+            try instSrl(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.srlv) {
+            try instSrlv(inst);
             return;
         } else if (r_type.function == Instruction.SpecialFunction.sub) {
             try instSub(inst);
@@ -896,7 +1011,6 @@ const interpreter = struct {
     }
 
     fn instCache(_: Instruction) CpuError!void {
-        log.debug("CACHE Instruction Stubbed.", .{ });
         pc += 4;
     }
 

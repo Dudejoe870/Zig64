@@ -1,7 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const MemRange = struct {
+const cic = @import("cic.zig");
+const io_map = @import("io_map.zig");
+
+pub const MemRange = struct {
     const Self = @This();
 
     buf: []align(4) u8,
@@ -51,6 +54,11 @@ const MemRange = struct {
         return dst_ptr.*;
     }
 
+    pub fn getWordPtr(self: *Self, offset: u32) *align(1) u32 {
+        std.debug.assert(offset & 0b11 == 0);
+        return @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
+    }
+
     // The way this works is all reads and writes are only done to the 32-bit boundary, 
     // and there are no byteswaps involved. The way this is accomplished is using masking.
     // By calculating the mask we need based on the 32-bit boundary, we can simplify IO register events, 
@@ -91,25 +99,25 @@ const MemRange = struct {
         const T = @TypeOf(value);
 
         if (T == u32) {
-            aligned_offset &= ~@as(u32, 0b11);
+            std.debug.assert(offset & 0b11 == 0);
 
             if (self.write_event) |event| should_write = event(aligned_offset, value, 0xFFFFFFFF);
             if (should_write) self.writeWord(aligned_offset, @bitCast(u32, value));
         } else if (T == u64) {
-            aligned_offset &= ~@as(u32, 0b111);
+            std.debug.assert(offset & 0b111 == 0);
 
             self.writeAligned(aligned_offset, @truncate(u32, value >> 32));
             self.writeAligned(aligned_offset + 4, @truncate(u32, value));
         } else if (T == u8 or T == u16) {
-            aligned_offset &= ~@as(u32, 0b11);
-
             var shift: u5 = undefined;
             if (T == u16) {
-                shift = ((@truncate(u5, offset) & 2) ^ 2) << 3;
+                std.debug.assert(offset & 0b1 == 0);
+                shift = ((@truncate(u5, aligned_offset) & 2) ^ 2) << 3;
             } else if (T == u8) {
-                shift = ((@truncate(u5, offset) & 3) ^ 3) << 3;
+                shift = ((@truncate(u5, aligned_offset) & 3) ^ 3) << 3;
             }
 
+            aligned_offset &= ~@as(u32, 0b11);
             const value_mask: u32 = (1 << @typeInfo(T).Int.bits) - 1;
 
             var value_to_write: u32 = @as(u32, value) << shift;
@@ -126,17 +134,16 @@ const MemRange = struct {
         var aligned_offset: u32 = offset;
 
         if (T == u32) {
-            aligned_offset &= ~@as(u32, 0b11);
-
+            std.debug.assert(offset & 0b11 == 0);
             if (self.read_event) |event| event(aligned_offset);
             return self.readWord(aligned_offset);
         } else if (T == u64) {
-            aligned_offset &= ~@as(u32, 0b111);
+            std.debug.assert(offset & 0b111 == 0);
             return self.readAligned(u32, aligned_offset + 4) | (@as(u64, self.readAligned(u32, aligned_offset)) << 32);
         } else if (T == u8 or T == u16) {
             var shift: u5 = undefined;
             if (T == u16) {
-                aligned_offset &= ~@as(u32, 0b1);
+                std.debug.assert(offset & 0b1 == 0);
                 shift = ((@truncate(u5, aligned_offset) & 2) ^ 2) << 3;
             } else if (T == u8) {
                 shift = ((@truncate(u5, aligned_offset) & 3) ^ 3) << 3;
@@ -181,13 +188,14 @@ pub const rdram = struct {
     };
 
     pub fn getReg(offset: RegRangeOffset, module: u8) *align(1) u32 {
-        return @ptrCast(*align(1) u32, 
-            &reg_range.buf[(@as(u32, module) * (@as(u32, rdram_module_reg_count)*@sizeOf(u32))) + @enumToInt(offset)]);
+        return reg_range.getWordPtr(@enumToInt(offset) + (module * rdram_module_reg_count * @sizeOf(u32)));
     }
 
     fn init() !void {
         dram = try MemRange.init(arena.allocator(), dram_size);
+        dram.clearToZero();
         reg_range = try MemRange.init(arena.allocator(), @as(u32, rdram_max_module_count)*rdram_module_reg_count*@sizeOf(u32));
+        reg_range.clearToZero();
 
         // Initialize RDRAM registers. (values from mupen64plus)
         std.debug.assert(rdram_module_count <= rdram_max_module_count);
@@ -228,14 +236,131 @@ pub const rcp = struct {
             sp_ibist_reg = 0x04
         };
 
+        fn regRange0WriteEvent(offset: u32, value: u32, mask: u32) bool {
+            const effective_value = value & mask;
+            if (offset == @enumToInt(RegRange0Offset.sp_mem_addr_reg) or
+                offset == @enumToInt(RegRange0Offset.sp_dram_addr_reg) or
+                offset == @enumToInt(RegRange0Offset.sp_rd_len_reg) or
+                offset == @enumToInt(RegRange0Offset.sp_wr_len_reg)) {
+                return true;
+            } else if (offset == @enumToInt(RegRange0Offset.sp_status_reg)) {
+                var status_reg = reg_range_0.getWordPtr(offset);
+
+                // Halt Bit
+                if (effective_value & 0b01 != 0) { // Clear
+                    status_reg.* &= ~@as(u32, 0b01);
+                }
+                if (effective_value & 0b10 != 0) { // Set
+                    status_reg.* |= 0b01;
+                }
+
+                // Broke bit
+                if (effective_value & 0b100 != 0) { // Clear
+                    status_reg.* &= ~@as(u32, 0b10);
+                }
+
+                // MI interrupt bit
+                var mi_intr_reg = rcp.mi.reg_range.getWordPtr(@enumToInt(rcp.mi.RegRangeOffset.mi_intr_reg));
+                if (effective_value & 0b01000 != 0) { // Clear
+                    mi_intr_reg.* &= ~@as(u32, 0b01);
+                }
+                if (effective_value & 0b10000 != 0) { // Set
+                    mi_intr_reg.* |= 0b01;
+                }
+
+                // Single-step bit
+                if (effective_value & 0b0100000 != 0) { // Clear
+                    status_reg.* &= ~@as(u32, 0b100000);
+                }
+                if (effective_value & 0b1000000 != 0) { // Set
+                    status_reg.* |= 0b100000;
+                }
+
+                // Interrupt on break bit
+                if (effective_value & 0b010000000 != 0) { // Clear
+                    status_reg.* &= ~@as(u32, 0b1000000);
+                }
+                if (effective_value & 0b100000000 != 0) { // Set
+                    status_reg.* |= 0b1000000;
+                }
+
+                // Signal 0 bit
+                if (effective_value & 0b01000000000 != 0) { // Clear
+                    status_reg.* &= ~@as(u32, 0b10000000);
+                }
+                if (effective_value & 0b10000000000 != 0) { // Set
+                    status_reg.* |= 0b10000000;
+                }
+
+                // Signal 1 bit
+                if (effective_value & 0b0100000000000 != 0) { // Clear
+                    status_reg.* &= ~@as(u32, 0b100000000);
+                }
+                if (effective_value & 0b1000000000000 != 0) { // Set
+                    status_reg.* |= 0b100000000;
+                }
+
+                // Signal 2 bit
+                if (effective_value & 0b010000000000000 != 0) { // Clear
+                    status_reg.* &= ~@as(u32, 0b1000000000);
+                }
+                if (effective_value & 0b100000000000000 != 0) { // Set
+                    status_reg.* |= 0b1000000000;
+                }
+
+                // Signal 3 bit
+                if (effective_value & 0b01000000000000000 != 0) { // Clear
+                    status_reg.* &= ~@as(u32, 0b10000000000);
+                }
+                if (effective_value & 0b10000000000000000 != 0) { // Set
+                    status_reg.* |= 0b10000000000;
+                }
+
+                // Signal 4 bit
+                if (effective_value & 0b0100000000000000000 != 0) { // Clear
+                    status_reg.* &= ~@as(u32, 0b100000000000);
+                }
+                if (effective_value & 0b1000000000000000000 != 0) { // Set
+                    status_reg.* |= 0b100000000000;
+                }
+
+                // Signal 5 bit
+                if (effective_value & 0b010000000000000000000 != 0) { // Clear
+                    status_reg.* &= ~@as(u32, 0b1000000000000);
+                }
+                if (effective_value & 0b100000000000000000000 != 0) { // Set
+                    status_reg.* |= 0b1000000000000;
+                }
+
+                // Signal 6 bit
+                if (effective_value & 0b01000000000000000000000 != 0) { // Clear
+                    status_reg.* &= ~@as(u32, 0b10000000000000);
+                }
+                if (effective_value & 0b10000000000000000000000 != 0) { // Set
+                    status_reg.* |= 0b10000000000000;
+                }
+
+                // Signal 7 bit
+                if (effective_value & 0b0100000000000000000000000 != 0) { // Clear
+                    status_reg.* &= ~@as(u32, 0b100000000000000);
+                }
+                if (effective_value & 0b1000000000000000000000000 != 0) { // Set
+                    status_reg.* |= 0b100000000000000;
+                }
+            }
+            return false;
+        }
+
         fn init() !void {
             dmem = try MemRange.init(arena.allocator(), 0x1000);
             imem = try MemRange.init(arena.allocator(), 0x1000);
 
-            reg_range_0 = try MemRange.init(arena.allocator(), 8*@sizeOf(u32));
+            reg_range_0 = try MemRange.initWithEvents(arena.allocator(), 8*@sizeOf(u32), regRange0WriteEvent, null);
             reg_range_0.clearToZero();
             reg_range_1 = try MemRange.init(arena.allocator(), 2*@sizeOf(u32));
             reg_range_1.clearToZero();
+
+            reg_range_0.getWordPtr(@enumToInt(RegRange0Offset.sp_status_reg)).* = 0x00000001;
         }
     };
 
@@ -277,9 +402,17 @@ pub const rcp = struct {
             mi_intr_mask_reg = 0x0C
         };
 
+        fn miWriteEvent(offset: u32, _: u32, _: u32) bool {
+            if (offset == @enumToInt(RegRangeOffset.mi_intr_mask_reg)) {
+                // TODO: Implement MI_INTR_MASK_REG behaviour.
+            }
+            return false;
+        }
+
         fn init() !void {
-            reg_range = try MemRange.init(arena.allocator(), 4*@sizeOf(u32));
+            reg_range = try MemRange.initWithEvents(arena.allocator(), 4*@sizeOf(u32), miWriteEvent, null);
             reg_range.clearToZero();
+            reg_range.getWordPtr(@enumToInt(RegRangeOffset.mi_version_reg)).* = 0x02020102;
         }
     };
 
@@ -345,8 +478,30 @@ pub const rcp = struct {
             pi_bsd_dom2_rls_reg = 0x30,
         };
 
+        fn piWriteEvent(offset: u32, value: u32, mask: u32) bool {
+            const effective_value = value & mask;
+            if (offset == @enumToInt(RegRangeOffset.pi_status_reg)) {
+                if (effective_value & 0b01 != 0) { // Reset Controller
+                    // TODO: PIF controller stuff.
+                }
+
+                var mi_intr_reg = rcp.mi.reg_range.getWordPtr(@enumToInt(rcp.mi.RegRangeOffset.mi_intr_reg));
+                if (effective_value & 0b10 != 0) { // Clear MI Interrupt bit
+                    mi_intr_reg.* &= ~@as(u32, 0b10000);
+                }
+                return false;
+            } else if (offset == @enumToInt(RegRangeOffset.pi_wr_len_reg)) {
+                // TODO: Delay PI DMA
+                var length = effective_value+1;
+                var dram_offset = (reg_range.getWordPtr(@enumToInt(RegRangeOffset.pi_dram_addr_reg)).* & 0x1FFFFFFF) - io_map.rdram_base_addr;
+                var cart_offset = (reg_range.getWordPtr(@enumToInt(RegRangeOffset.pi_cart_addr_reg)).* & 0x1FFFFFFF) - io_map.cart_dom1_addr2_base_addr;
+                std.mem.copy(u8, rdram.dram.buf[dram_offset..dram_offset+length], cart.rom.buf[cart_offset..cart_offset+length]);
+            }
+            return true;
+        }
+
         fn init() !void {
-            reg_range = try MemRange.init(arena.allocator(), 13*@sizeOf(u32));
+            reg_range = try MemRange.initWithEvents(arena.allocator(), 13*@sizeOf(u32), piWriteEvent, null);
             reg_range.clearToZero();
         }
     };
@@ -406,6 +561,8 @@ pub const cart = struct {
         var size = std.math.min(max_cart_size, try rom_file.getEndPos());
         rom = try MemRange.initWithEvents(arena.allocator(), size, MemRange.readOnlyWriteEvent, null);
         _ = try rom.writeFromFile(rom_file);
+
+        cic.init();
     }
 };
 
@@ -421,7 +578,24 @@ pub const pif = struct {
             }
             _ = try boot_rom.writeFromFile(file);
         }
+
         ram = try MemRange.init(arena.allocator(), 64);
+        ram.clearToZero();
+
+        // HACK: for allowing pifbootrom execution (from mupen64plus device/pif/pif.c)
+        var rom_type: u32 = switch (cic.current_cic.version == ._8303 or cic.current_cic.version == ._8401 or cic.current_cic.version == ._8501) {
+            true => 1,
+            false => 0
+        };
+        var s7: u32 = 0;
+        var reset_type: u32 = 0;
+
+        ram.getWordPtr(0x24).* = 
+            (((rom_type & 0x1) << 19)
+                | ((s7 & 0x1) << 18)
+                | ((reset_type & 0x1) << 17)
+                | (@as(u32, cic.current_cic.seed) << 8)
+                | 0x3f);
     }
 };
 
