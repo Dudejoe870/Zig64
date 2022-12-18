@@ -93,7 +93,7 @@ fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8) !void {
         try ui.renderUI();
 
         c.igRender();
-        try glfw.makeContextCurrent(window);
+        
         gl.viewport(0, 0, @floatToInt(gl.GLint, io.*.DisplaySize.x), @floatToInt(gl.GLint, io.*.DisplaySize.y));
         gl.clearColor(0, 0, 0, 1);
         gl.clear(gl.COLOR_BUFFER_BIT);

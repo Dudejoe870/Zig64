@@ -49,11 +49,6 @@ fn renderCpuInspector() !void {
     if (c.igBegin("CPU Inspector", null, 0)) {
         c.igTextUnformatted((try std.fmt.bufPrint(text_buffer[0..], 
             "pc = 0x{X}\x00", .{ r4300.pc })).ptr, null);
-        var instruction_ptr = io_map.getWordPtr(r4300.pc & 0x1FFFFFFF);
-        if (instruction_ptr) |ptr| {
-            c.igTextUnformatted((try std.fmt.bufPrint(text_buffer[0..], 
-                "instruction = 0x{X}\x00", .{ ptr.* })).ptr, null);
-        }
 
         if (c.igCollapsingHeader_TreeNodeFlags("General Purpose Registers", 0)) {
             for (r4300.gpr) |reg, i| {

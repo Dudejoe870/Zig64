@@ -434,20 +434,7 @@ pub fn step() CpuError!void {
     var inst = InstructionBits { 
         .bits = instruction_ptr.?.*
     };
-
-    var original_mode = c.fegetround();
-    _ = c.fesetround(switch (getFcr31Flags().rounding_mode) {
-        .nearest => c.FE_TONEAREST,
-        .toward_zero => c.FE_TOWARDZERO,
-        .positive_inf => c.FE_UPWARD,
-        .negative_inf => c.FE_DOWNWARD
-    });
-    if (inst.bits != 0) {
-        try interpreter.opcode_lookup[inst.instruction.opcode](inst.instruction);
-    } else {
-        pc += 4;
-    }
-    _ = c.fesetround(original_mode);
+    try interpreter.executeInstruction(inst.instruction);
 
     // Handle jumps and branches.
     if ((jump_target != null or branch_target != null or jump_reg_target != null) and !is_delay_slot) {
@@ -468,9 +455,8 @@ pub fn step() CpuError!void {
 }
 
 const interpreter = struct {
-    pub const opcode_lookup = init: { 
+    const opcode_lookup = init: { 
         var table = [_]*const fn(Instruction) CpuError!void { instStub } ** (std.math.maxInt(u6)+1);
-        table[0b000000] = instSpecial;
         table[0b001000] = instAddi;
         table[0b001001] = instAddiu;
         table[0b001100] = instAndi;
@@ -518,6 +504,64 @@ const interpreter = struct {
         break :init table;
     };
 
+    const special_table = init: {
+        var table = [_]*const fn(Instruction) CpuError!void { instStubSpecial } ** (std.math.maxInt(u6)+1);
+        table[@enumToInt(Instruction.SpecialFunction.add)] = instAdd;
+        table[@enumToInt(Instruction.SpecialFunction.addu)] = instAddu;
+        table[@enumToInt(Instruction.SpecialFunction._and)] = instAnd;
+        table[@enumToInt(Instruction.SpecialFunction._break)] = instBreak;
+        table[@enumToInt(Instruction.SpecialFunction.dadd)] = instDadd;
+        table[@enumToInt(Instruction.SpecialFunction.daddu)] = instDaddu;
+        table[@enumToInt(Instruction.SpecialFunction.ddiv)] = instDdiv;
+        table[@enumToInt(Instruction.SpecialFunction.ddivu)] = instDdivu;
+        table[@enumToInt(Instruction.SpecialFunction.div)] = instDiv;
+        table[@enumToInt(Instruction.SpecialFunction.divu)] = instDivu;
+        table[@enumToInt(Instruction.SpecialFunction.dmult)] = instDmult;
+        table[@enumToInt(Instruction.SpecialFunction.dmultu)] = instDmultu;
+        table[@enumToInt(Instruction.SpecialFunction.dsll)] = instDsll;
+        table[@enumToInt(Instruction.SpecialFunction.dsllv)] = instDsllv;
+        table[@enumToInt(Instruction.SpecialFunction.dsll32)] = instDsll32;
+        table[@enumToInt(Instruction.SpecialFunction.dsra)] = instDsra;
+        table[@enumToInt(Instruction.SpecialFunction.dsrav)] = instDsrav;
+        table[@enumToInt(Instruction.SpecialFunction.dsra32)] = instDsra32;
+        table[@enumToInt(Instruction.SpecialFunction.dsrl)] = instDsrl;
+        table[@enumToInt(Instruction.SpecialFunction.dsrlv)] = instDsrlv;
+        table[@enumToInt(Instruction.SpecialFunction.dsrl32)] = instDsrl32;
+        table[@enumToInt(Instruction.SpecialFunction.dsub)] = instDsub;
+        table[@enumToInt(Instruction.SpecialFunction.dsubu)] = instDsubu;
+        table[@enumToInt(Instruction.SpecialFunction.jalr)] = instJalr;
+        table[@enumToInt(Instruction.SpecialFunction.jr)] = instJr;
+        table[@enumToInt(Instruction.SpecialFunction.mfhi)] = instMfhi;
+        table[@enumToInt(Instruction.SpecialFunction.mflo)] = instMflo;
+        table[@enumToInt(Instruction.SpecialFunction.mthi)] = instMthi;
+        table[@enumToInt(Instruction.SpecialFunction.mtlo)] = instMtlo;
+        table[@enumToInt(Instruction.SpecialFunction.mult)] = instMult;
+        table[@enumToInt(Instruction.SpecialFunction.multu)] = instMultu;
+        table[@enumToInt(Instruction.SpecialFunction.nor)] = instNor;
+        table[@enumToInt(Instruction.SpecialFunction._or)] = instOr;
+        table[@enumToInt(Instruction.SpecialFunction.sll)] = instSll;
+        table[@enumToInt(Instruction.SpecialFunction.sllv)] = instSllv;
+        table[@enumToInt(Instruction.SpecialFunction.slt)] = instSlt;
+        table[@enumToInt(Instruction.SpecialFunction.sltu)] = instSltu;
+        table[@enumToInt(Instruction.SpecialFunction.sra)] = instSra;
+        table[@enumToInt(Instruction.SpecialFunction.srav)] = instSrav;
+        table[@enumToInt(Instruction.SpecialFunction.srl)] = instSrl;
+        table[@enumToInt(Instruction.SpecialFunction.srlv)] = instSrlv;
+        table[@enumToInt(Instruction.SpecialFunction.sub)] = instSub;
+        table[@enumToInt(Instruction.SpecialFunction.subu)] = instSubu;
+        table[@enumToInt(Instruction.SpecialFunction.sync)] = instNop;
+        table[@enumToInt(Instruction.SpecialFunction.xor)] = instXor;
+        break :init table;
+    };
+
+    inline fn executeInstruction(inst: Instruction) CpuError!void {
+        if (inst.opcode == 0b000000) {
+            try special_table[@enumToInt(inst.data.r_type.function)](inst);
+        } else {
+            try opcode_lookup[inst.opcode](inst);
+        }
+    }
+
     inline fn branch(offset: i16) void {
         branch_target = @as(i32, offset) << 2;
     }
@@ -542,150 +586,17 @@ const interpreter = struct {
         return @bitCast(u32, @bitCast(i32, @truncate(u32, gpr[base])) + @as(i32, offset));
     }
 
-    fn instSpecial(inst: Instruction) CpuError!void {
-        const r_type = inst.data.r_type;
-        if (r_type.function == Instruction.SpecialFunction.add) {
-            try instAdd(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.addu) {
-            try instAddu(inst);
-            return;
-        } else if(r_type.function == Instruction.SpecialFunction._and) {
-            try instAnd(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction._break) {
-            try instBreak(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dadd) {
-            try instDadd(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.daddu) {
-            try instDaddu(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.ddiv) {
-            try instDdiv(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.ddivu) {
-            try instDdivu(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.div) {
-            try instDiv(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.divu) {
-            try instDivu(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dmult) {
-            try instDmult(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dmultu) {
-            try instDmultu(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dsll) {
-            try instDsll(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dsllv) {
-            try instDsllv(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dsll32) {
-            try instDsll32(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dsra) {
-            try instDsra(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dsrav) {
-            try instDsrav(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dsra32) {
-            try instDsra32(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dsrl) {
-            try instDsrl(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dsrlv) {
-            try instDsrlv(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dsrl32) {
-            try instDsrl32(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dsub) {
-            try instDsub(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.dsubu) {
-            try instDsubu(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.jalr) {
-            try instJalr(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.jr) {
-            try instJr(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.mfhi) {
-            try instMfhi(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.mflo) {
-            try instMflo(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.mthi) {
-            try instMthi(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.mtlo) {
-            try instMtlo(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.mult) {
-            try instMult(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.multu) {
-            try instMultu(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.nor) {
-            try instNor(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction._or) {
-            try instOr(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.sll) {
-            try instSll(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.sllv) {
-            try instSllv(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.slt) {
-            try instSlt(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.sltu) {
-            try instSltu(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.sra) {
-            try instSra(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.srav) {
-            try instSrav(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.srl) {
-            try instSrl(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.srlv) {
-            try instSrlv(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.sub) {
-            try instSub(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.subu) {
-            try instSubu(inst);
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.sync) {
-            pc += 4;
-            return;
-        } else if (r_type.function == Instruction.SpecialFunction.xor) {
-            try instXor(inst);
-            return;
-        } else {
-            log.err("Unknown SPECIAL function 0b{b}", .{ @enumToInt(r_type.function) });
-            return error.UnknownInstruction;
-        }
+    fn instNop(_: Instruction) CpuError!void {
+        pc += 4;
     }
 
-    inline fn instAdd(inst: Instruction) CpuError!void {
+    fn instStubSpecial(inst: Instruction) CpuError!void {
+        const r_type = inst.data.r_type;
+        log.err("Unknown SPECIAL function 0b{b}", .{ @enumToInt(r_type.function) });
+        return error.UnknownInstruction;
+    }
+
+    fn instAdd(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
         var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
@@ -721,7 +632,7 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instAddu(inst: Instruction) CpuError!void {
+    fn instAddu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
         var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
@@ -729,7 +640,7 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instAnd(inst: Instruction) CpuError!void {
+    fn instAnd(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rs] & gpr[r_type.rt];
         pc += 4;
@@ -1009,7 +920,7 @@ const interpreter = struct {
         }
     }
 
-    inline fn instBreak(_: Instruction) CpuError!void {
+    fn instBreak(_: Instruction) CpuError!void {
         log.err("BREAK instruction not implemented.", .{ });
         return error.NotImplemented;
     }
@@ -1045,7 +956,7 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instDadd(inst: Instruction) CpuError!void {
+    fn instDadd(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var result: i64 = 0;
         if (@addWithOverflow(i64, @bitCast(i64, gpr[r_type.rs]), @bitCast(i64, gpr[r_type.rt]), &result)) {
@@ -1077,13 +988,13 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instDaddu(inst: Instruction) CpuError!void {
+    fn instDaddu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @bitCast(i64, gpr[r_type.rs]) +% @bitCast(i64, gpr[r_type.rt]));
         pc += 4;
     }
 
-    inline fn instDdiv(inst: Instruction) CpuError!void {
+    fn instDdiv(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var numerator = @bitCast(i64, gpr[r_type.rs]);
         var denominator = @bitCast(i64, gpr[r_type.rt]);
@@ -1098,7 +1009,7 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instDdivu(inst: Instruction) CpuError!void {
+    fn instDdivu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var numerator = gpr[r_type.rs];
         var denominator = gpr[r_type.rt];
@@ -1113,7 +1024,7 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instDiv(inst: Instruction) CpuError!void {
+    fn instDiv(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var numerator = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
         var denominator = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
@@ -1128,7 +1039,7 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instDivu(inst: Instruction) CpuError!void {
+    fn instDivu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var numerator = @truncate(u32, gpr[r_type.rs]);
         var denominator = @truncate(u32, gpr[r_type.rt]);
@@ -1143,7 +1054,7 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instDmult(inst: Instruction) CpuError!void {
+    fn instDmult(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var result = @bitCast(u128, 
             @as(i128, @bitCast(i64, gpr[r_type.rs])) *% 
@@ -1153,7 +1064,7 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instDmultu(inst: Instruction) CpuError!void {
+    fn instDmultu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var result = @as(u128, gpr[r_type.rs]) *% @as(u128, gpr[r_type.rt]);
         lo = @truncate(u64, result);
@@ -1161,61 +1072,61 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instDsll(inst: Instruction) CpuError!void {
+    fn instDsll(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rt] << r_type.sa;
         pc += 4;
     }
 
-    inline fn instDsllv(inst: Instruction) CpuError!void {
+    fn instDsllv(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rt] << @truncate(u5, gpr[r_type.rs]);
         pc += 4;
     }
 
-    inline fn instDsll32(inst: Instruction) CpuError!void {
+    fn instDsll32(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rt] << (@as(u6, r_type.sa) + 32);
         pc += 4;
     }
 
-    inline fn instDsra(inst: Instruction) CpuError!void {
+    fn instDsra(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @bitCast(i64, gpr[r_type.rt]) >> r_type.sa);
         pc += 4;
     }
 
-    inline fn instDsrav(inst: Instruction) CpuError!void {
+    fn instDsrav(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @bitCast(i64, gpr[r_type.rt]) >> @truncate(u5, gpr[r_type.rs]));
         pc += 4;
     }
 
-    inline fn instDsra32(inst: Instruction) CpuError!void {
+    fn instDsra32(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @bitCast(i64, gpr[r_type.rt]) >> (@as(u6, r_type.sa) + 32));
         pc += 4;
     }
 
-    inline fn instDsrl(inst: Instruction) CpuError!void {
+    fn instDsrl(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rt] >> r_type.sa;
         pc += 4;
     }
 
-    inline fn instDsrlv(inst: Instruction) CpuError!void {
+    fn instDsrlv(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rt] >> @truncate(u5, gpr[r_type.rs]);
         pc += 4;
     }
 
-    inline fn instDsrl32(inst: Instruction) CpuError!void {
+    fn instDsrl32(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rt] >> (@as(u6, r_type.sa) + 32);
         pc += 4;
     }
 
-    inline fn instDsub(inst: Instruction) CpuError!void {
+    fn instDsub(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var result: i64 = 0;
         if (@subWithOverflow(i64, @bitCast(i64, gpr[r_type.rs]), @bitCast(i64, gpr[r_type.rt]), &result)) {
@@ -1227,7 +1138,7 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instDsubu(inst: Instruction) CpuError!void {
+    fn instDsubu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @bitCast(i64, gpr[r_type.rs]) -% @bitCast(i64, gpr[r_type.rt]));
         pc += 4;
@@ -1274,13 +1185,13 @@ const interpreter = struct {
         jump(j_type.target);
     }
 
-    inline fn instJalr(inst: Instruction) CpuError!void {
+    fn instJalr(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         linkReg(r_type.rd);
         jumpReg(r_type.rs);
     }
 
-    inline fn instJr(inst: Instruction) CpuError!void {
+    fn instJr(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         jumpReg(r_type.rs);
     }
@@ -1409,13 +1320,13 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instMfhi(inst: Instruction) CpuError!void {
+    fn instMfhi(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = hi;
         pc += 4;
     }
 
-    inline fn instMflo(inst: Instruction) CpuError!void {
+    fn instMflo(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = lo;
         pc += 4;
@@ -1433,19 +1344,19 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instMthi(inst: Instruction) CpuError!void {
+    fn instMthi(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         hi = gpr[r_type.rs];
         pc += 4;
     }
 
-    inline fn instMtlo(inst: Instruction) CpuError!void {
+    fn instMtlo(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         lo = gpr[r_type.rs];
         pc += 4;
     }
 
-    inline fn instMult(inst: Instruction) CpuError!void {
+    fn instMult(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var result =
             @as(i64, @bitCast(i32, @truncate(u32, gpr[r_type.rs]))) *% 
@@ -1455,7 +1366,7 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instMultu(inst: Instruction) CpuError!void {
+    fn instMultu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var result = @as(u64, @truncate(u32, gpr[r_type.rs])) *% @as(u64, @truncate(u32, gpr[r_type.rt]));
         lo = @bitCast(u64, @as(i64, @bitCast(i32, @truncate(u32, result))));
@@ -1463,13 +1374,13 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instNor(inst: Instruction) CpuError!void {
+    fn instNor(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = ~(gpr[r_type.rs] | gpr[r_type.rt]);
         pc += 4;
     }
 
-    inline fn instOr(inst: Instruction) CpuError!void {
+    fn instOr(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rs] | gpr[r_type.rt];
         pc += 4;
@@ -1527,21 +1438,21 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instSll(inst: Instruction) CpuError!void {
+    fn instSll(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @as(i64, 
             @bitCast(i32, @truncate(u32, gpr[r_type.rt]) << r_type.sa)));
         pc += 4;
     }
 
-    inline fn instSllv(inst: Instruction) CpuError!void {
+    fn instSllv(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @as(i64, 
             @bitCast(i32, @truncate(u32, gpr[r_type.rt]) << @truncate(u5, gpr[r_type.rs]))));
         pc += 4;
     }
 
-    inline fn instSlt(inst: Instruction) CpuError!void {
+    fn instSlt(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @boolToInt(@bitCast(i64, gpr[r_type.rs]) < @bitCast(i64, gpr[r_type.rt]));
         pc += 4;
@@ -1559,41 +1470,41 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instSltu(inst: Instruction) CpuError!void {
+    fn instSltu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @boolToInt(gpr[r_type.rs] < gpr[r_type.rt]);
         pc += 4;
     }
 
-    inline fn instSra(inst: Instruction) CpuError!void {
+    fn instSra(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @as(i64, 
             @bitCast(i32, @truncate(u32, gpr[r_type.rt])) >> r_type.sa));
         pc += 4;
     }
 
-    inline fn instSrav(inst: Instruction) CpuError!void {
+    fn instSrav(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @as(i64, 
             @bitCast(i32, @truncate(u32, gpr[r_type.rt])) >> @truncate(u5, gpr[r_type.rs])));
         pc += 4;
     }
 
-    inline fn instSrl(inst: Instruction) CpuError!void {
+    fn instSrl(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @as(i64, @bitCast(i32,
             @truncate(u32, gpr[r_type.rt]) >> r_type.sa)));
         pc += 4;
     }
 
-    inline fn instSrlv(inst: Instruction) CpuError!void {
+    fn instSrlv(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @as(i64, @bitCast(i32, 
             @truncate(u32, gpr[r_type.rt]) >> @truncate(u5, gpr[r_type.rs]))));
         pc += 4;
     }
 
-    inline fn instSub(inst: Instruction) CpuError!void {
+    fn instSub(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
         var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
@@ -1607,7 +1518,7 @@ const interpreter = struct {
         pc += 4;
     }
 
-    inline fn instSubu(inst: Instruction) CpuError!void {
+    fn instSubu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         var rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
         var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
@@ -1644,7 +1555,7 @@ const interpreter = struct {
 
     // TODO: Implement the TLB alongside the TLBP, TLBR, TLBWI, and TLBWR instructions
 
-    inline fn instXor(inst: Instruction) CpuError!void {
+    fn instXor(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rs] ^ gpr[r_type.rt];
         pc += 4;

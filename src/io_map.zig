@@ -24,14 +24,13 @@ pub const cart_dom1_addr2_base_addr: u32 = 0x10000000;
 pub const pif_boot_rom_base_addr: u32 = 0x1fc00000;
 pub const pif_ram_base_addr: u32 = 0x1fc007c0;
 
-// Everything is compile-time evaluated into individual checks at run-time.
-// TODO: Replace this with binary search.
 const MemoryEntry = struct {
     memory: *memory.MemRange,
     address: u32
 };
 
-const memory_entries = .{ 
+// Keep sorted by address
+const memory_entries = [_]MemoryEntry { 
     MemoryEntry { .address = rdram_base_addr, .memory = &memory.rdram.dram },
     MemoryEntry { .address = rdram_reg_base_addr, .memory = &memory.rdram.reg_range },
     MemoryEntry { .address = sp_dmem_base_addr, .memory = &memory.rcp.rsp.dmem },
@@ -51,32 +50,53 @@ const memory_entries = .{
     MemoryEntry { .address = pif_ram_base_addr, .memory = &memory.pif.ram }
 };
 
-pub fn getWordPtr(physical_address: u32) ?*align(1) u32 {
-    inline for (memory_entries) |e| {
-        if (physical_address >= e.address and physical_address < e.address + e.memory.buf.len) {
-            return e.memory.getWordPtr(physical_address - e.address);
-        }
+// Do a binary search through the memory entries.
+inline fn getMemoryEntry(physical_address: u32) ?*const MemoryEntry {
+    // Early out for RDRAM.
+    if (physical_address >= rdram_base_addr and physical_address < rdram_base_addr + memory.rdram.dram_size) {
+        return &memory_entries[0];
     }
 
+    var i: usize = 0;
+    var j = memory_entries.len - 1;
+    while (i < j) {
+        const mid = (i + j) >> 1; // divided by 2
+        const entry = &memory_entries[mid];
+        if (entry.address + entry.memory.buf.len <= physical_address) {
+            i = mid + 1;
+        } else if (entry.address > physical_address) {
+            j = mid - 1;
+        } else {
+            return &memory_entries[mid];
+        }
+    }
+    if (physical_address >= memory_entries[i].address and 
+        physical_address < memory_entries[i].address + memory_entries[i].memory.buf.len) {
+        return &memory_entries[j];
+    }
     return null;
+}
+
+pub fn getWordPtr(physical_address: u32) ?*align(1) u32 {
+    const entry = getMemoryEntry(physical_address);
+    if (entry == null) return null;
+
+    return entry.?.memory.getWordPtr(physical_address - entry.?.address);
 }
 
 pub fn writeAligned(physical_address: u32, value: anytype) void {
     const T = @TypeOf(value);
-
     comptime {
         std.debug.assert(T == u8 or T == u16 or T == u32 or T == u64);
     }
 
-    inline for (memory_entries) |e| {
-        if (physical_address >= e.address and physical_address < e.address + e.memory.buf.len) {
-            e.memory.writeAligned(physical_address - e.address, value);
-            return;
-        }
+    const entry = getMemoryEntry(physical_address);
+    if (entry == null) {
+        log.warn("Trying to write to unmapped memory at address 0x{X}!", .{ physical_address });
+        return;
     }
 
-    log.warn("Trying to write to unmapped memory at address 0x{X}!", .{ physical_address });
-    return;
+    entry.?.memory.writeAligned(physical_address - entry.?.address, value);
 }
 
 pub fn readAligned(comptime T: type, physical_address: u32) T {
@@ -84,12 +104,11 @@ pub fn readAligned(comptime T: type, physical_address: u32) T {
         std.debug.assert(T == u8 or T == u16 or T == u32 or T == u64);
     }
 
-    inline for (memory_entries) |e| {
-        if (physical_address >= e.address and physical_address < e.address + e.memory.buf.len) {
-            return e.memory.readAligned(T, physical_address - e.address);
-        }
+    const entry = getMemoryEntry(physical_address);
+    if (entry == null) {
+        log.warn("Trying to read from unmapped memory at address 0x{X}!", .{ physical_address });
+        return @as(T, 0);
     }
 
-    log.warn("Trying to read from unmapped memory at address 0x{X}!", .{ physical_address });
-    return @as(T, 0);
+    return entry.?.memory.readAligned(T, physical_address - entry.?.address);
 }
