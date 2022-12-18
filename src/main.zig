@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 
 const system = @import("system.zig");
 const ui = @import("ui.zig");
+const vi_renderer = @import("vi_renderer.zig");
+
 const c = @import("c.zig");
 
 const glfw = @import("glfw");
@@ -58,8 +60,8 @@ fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8) !void {
 
     const window = try glfw.Window.create(640, 480, "Zig64", null, null, .{
         .opengl_profile = .opengl_core_profile,
-        .context_version_major = 4,
-        .context_version_minor = 6,
+        .context_version_major = 3,
+        .context_version_minor = 3
     });
     defer window.destroy();
 
@@ -67,6 +69,9 @@ fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8) !void {
 
     const proc: glfw.GLProc = undefined;
     try gl.load(proc, glGetProcAddress);
+
+    try vi_renderer.init();
+    defer vi_renderer.deinit();
 
     _ = c.igCreateContext(null);
 
@@ -93,7 +98,7 @@ fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8) !void {
         gl.clearColor(0, 0, 0, 1);
         gl.clear(gl.COLOR_BUFFER_BIT);
 
-        // TODO: Render N64 Framebuffer
+        try vi_renderer.render();
 
         c.ImGui_ImplOpenGL3_RenderDrawData(c.igGetDrawData());
 

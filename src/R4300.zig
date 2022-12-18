@@ -222,6 +222,7 @@ pub const Instruction = packed struct(u32) {
         srlv   = 0b000110,
         sub    = 0b100010,
         subu   = 0b100011,
+        sync   = 0b001111,
         xor    = 0b100110
     };
 
@@ -671,6 +672,9 @@ const interpreter = struct {
             return;
         } else if (r_type.function == Instruction.SpecialFunction.subu) {
             try instSubu(inst);
+            return;
+        } else if (r_type.function == Instruction.SpecialFunction.sync) {
+            pc += 4;
             return;
         } else if (r_type.function == Instruction.SpecialFunction.xor) {
             try instXor(inst);

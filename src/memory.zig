@@ -435,6 +435,50 @@ pub const rcp = struct {
             vi_y_scale_reg = 0x34
         };
 
+        pub const Bpp = enum(u2) {
+            blank = 0,
+            _reserved = 1,
+            _16bit = 2,
+            _32bit = 3
+        };
+
+        pub const AaMode = enum(u2) {
+            aa_resample_always_fetch_extra_lines = 0,
+            aa_resample_fetch_extra_lines_if_needed = 1,
+            resample_only = 2,
+            disabled = 3
+        };
+
+        pub const ViStatusRegister = packed struct(u32) {
+            bpp: Bpp,
+            gamma_dither_enable: bool,
+            gamma_enable: bool,
+            divot_enable: bool,
+            vbus_clock_enable: bool,
+            interlace_enable: bool,
+            test_mode: bool,
+            aa_mode: AaMode,
+            _undefined: bool,
+            kill_we: bool,
+            pixel_advance: u4,
+            dither_filter_enable: bool,
+            _unused: u15,
+
+            pub fn getPixelSize(self: @This()) u5 {
+                return switch (self.bpp) {
+                    .blank => 0,
+                    ._reserved => 0,
+                    ._16bit => @sizeOf(u16),
+                    ._32bit => @sizeOf(u32)
+                };
+            }
+        };
+
+        pub inline fn getViStatusFlags() *align(1) ViStatusRegister {
+            return @ptrCast(*align(1) ViStatusRegister, reg_range.getWordPtr(
+                @enumToInt(RegRangeOffset.vi_status_reg)));
+        }
+
         fn init() !void {
             reg_range = try MemRange.init(arena.allocator(), 14*@sizeOf(u32));
             reg_range.clearToZero();

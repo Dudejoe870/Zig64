@@ -28,7 +28,7 @@ pub fn build(b: *Builder) !void {
         "-DIMGUI_IMPL_API=extern \"C\"",
         "-DIMGUI_IMPL_OPENGL_LOADER_GL3W"
     });
-    exe.addPackagePath("gl", "opengl/gl_4v6.zig");
+    exe.addPackagePath("gl", "opengl/gl_3v3.zig");
 
     exe.addPackage(glfw.pkg);
     try glfw.link(b, exe, .{ .opengl = true });
