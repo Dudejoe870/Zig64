@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const cic = @import("cic.zig");
-const io_map = @import("io_map.zig");
+const cpu_bus = @import("cpu_bus.zig");
 
 pub const MemRange = struct {
     const Self = @This();
@@ -106,8 +106,12 @@ pub const MemRange = struct {
         } else if (T == u64) {
             std.debug.assert(offset & 0b111 == 0);
 
-            self.writeAligned(aligned_offset, @truncate(u32, value >> 32));
-            self.writeAligned(aligned_offset + 4, @truncate(u32, value));
+            if (self.write_event) |event| should_write = event(aligned_offset, @truncate(u32, value >> 32), 0xFFFFFFFF);
+            if (should_write) self.writeWord(aligned_offset, @bitCast(u32, @truncate(u32, value >> 32)));
+            should_write = true;
+
+            if (self.write_event) |event| should_write = event(aligned_offset, @truncate(u32, value), 0xFFFFFFFF);
+            if (should_write) self.writeWord(aligned_offset, @bitCast(u32, @truncate(u32, value)));
         } else if (T == u8 or T == u16) {
             var shift: u5 = undefined;
             if (T == u16) {
@@ -474,13 +478,23 @@ pub const rcp = struct {
             }
         };
 
+        fn viWriteEvent(offset: u32, value: u32, mask: u32) bool {
+            _ = value;
+            _ = mask;
+            if (offset == @enumToInt(RegRangeOffset.vi_current_reg)) {
+                var mi_intr_reg = rcp.mi.reg_range.getWordPtr(@enumToInt(rcp.mi.RegRangeOffset.mi_intr_reg));
+                mi_intr_reg.* &= ~@as(u32, 0b1000);
+            }
+            return true;
+        }
+
         pub inline fn getViStatusFlags() *align(1) ViStatusRegister {
             return @ptrCast(*align(1) ViStatusRegister, reg_range.getWordPtr(
                 @enumToInt(RegRangeOffset.vi_status_reg)));
         }
 
         fn init() !void {
-            reg_range = try MemRange.init(arena.allocator(), 14*@sizeOf(u32));
+            reg_range = try MemRange.initWithEvents(arena.allocator(), 14*@sizeOf(u32), viWriteEvent, null);
             reg_range.clearToZero();
         }
     };
@@ -537,8 +551,8 @@ pub const rcp = struct {
             } else if (offset == @enumToInt(RegRangeOffset.pi_wr_len_reg)) {
                 // TODO: Delay PI DMA
                 var length = effective_value+1;
-                var dram_offset = (reg_range.getWordPtr(@enumToInt(RegRangeOffset.pi_dram_addr_reg)).* & 0x1FFFFFFF) - io_map.rdram_base_addr;
-                var cart_offset = (reg_range.getWordPtr(@enumToInt(RegRangeOffset.pi_cart_addr_reg)).* & 0x1FFFFFFF) - io_map.cart_dom1_addr2_base_addr;
+                var dram_offset = (reg_range.getWordPtr(@enumToInt(RegRangeOffset.pi_dram_addr_reg)).* & 0x1FFFFFFF) - cpu_bus.rdram_base_addr;
+                var cart_offset = (reg_range.getWordPtr(@enumToInt(RegRangeOffset.pi_cart_addr_reg)).* & 0x1FFFFFFF) - cpu_bus.cart_dom1_addr2_base_addr;
                 std.mem.copy(u8, rdram.dram.buf[dram_offset..dram_offset+length], cart.rom.buf[cart_offset..cart_offset+length]);
             }
             return true;

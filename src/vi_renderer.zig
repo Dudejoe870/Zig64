@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const io_map = @import("io_map.zig");
+const cpu_bus = @import("cpu_bus.zig");
 const memory = @import("memory.zig");
 
 const gl = @import("gl");
@@ -135,7 +135,7 @@ pub fn render() !void {
     if (framebuffer_length == 0) return;
 
     var framebuffer_offset = @truncate(u29, memory.rcp.vi.reg_range.getWordPtr(
-        @enumToInt(memory.rcp.vi.RegRangeOffset.vi_origin_reg)).*) - io_map.rdram_base_addr;
+        @enumToInt(memory.rcp.vi.RegRangeOffset.vi_origin_reg)).*) - cpu_bus.rdram_base_addr;
     if (framebuffer_offset >= memory.rdram.dram_size or 
         framebuffer_offset + framebuffer_length >= memory.rdram.dram_size) return;
     

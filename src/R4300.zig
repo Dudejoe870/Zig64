@@ -1,6 +1,7 @@
 const std = @import("std");
-const io_map = @import("io_map.zig");
+const cpu_bus = @import("cpu_bus.zig");
 const memory = @import("memory.zig");
+const system = @import("system.zig");
 const c = @import("c.zig");
 
 const log = std.log.scoped(.r4300);
@@ -88,33 +89,71 @@ pub const Cop0Register = enum(u8) {
     epc,
     previd,
     config,
-    lladdr,
+    _reserved1, // (Technically lladdr, but load linked doesn't exist on the N64)
     watchlo,
     watchhi,
-    xcontext,
-    _reserved1,
-    _reserved2,
+    _reserved2, // (Technically XContext, but the N64 can't go into 64-bit mode)
     _reserved3,
     _reserved4,
     _reserved5,
     _reserved6,
     _reserved7,
+    _reserved8,
+    _reserved9,
     taglo,
     taghi,
     errorepc,
-    _reserved8
+    _reserved10
+};
+const cp0_write_mask = [32]u32 {
+    0x8000003F, // index
+    0x00000000, // random
+    0x3FFFFFFF, // entrylo0
+    0x3FFFFFFF, // entrylo1
+    0xFF800000, // context (also has special handling in mtc0)
+    0x01FFE000, // pagemask
+    0xFFFFFFFF, // wired (also has special handling in mtc0)
+    0x00000000, // _reserved0
+    0x00000000, // bad_vaddr
+    0x00000000, // count
+    0xFFFFE0FF, // entryhi
+    0xFFFFFFFF, // compare (also has special handling in mtc0)
+    0xFFFFFFFF, // status
+    0x00008300, // cause (also has special handling in mtc0)
+    0xFFFFFFFF, // epc
+    0x00000000, // previd
+    0xFFFFFFFF, // config
+    0x00000000, // _reserved1
+    0xFFFFFFFF, // watchlo
+    0xFFFFFFFF, // watchhi
+    0x00000000, // _reserved2
+    0x00000000, // _reserved3
+    0x00000000, // _reserved4
+    0x00000000, // _reserved5
+    0x00000000, // _reserved6
+    0x00000000, // _reserved7
+    0x00000000, // _reserved8
+    0x00000000, // _reserved9
+    0x0FFFFFC0, // taglo
+    0x00000000, // taghi (also has special handling in mtc0)
+    0xFFFFFFFF, // errorepc
+    0x00000000, // _reserved10
 };
 
-pub const InterruptBits = packed struct(u8) {
-    software_interrupt0: bool,
-    software_interrupt1: bool,
-    external: packed union {
-        flags: packed struct {
-            // TODO
+pub const InterruptBits = packed union { 
+    flags: packed struct(u8) {
+        software_interrupt0: bool,
+        software_interrupt1: bool,
+        external: packed union {
+            flags: packed struct(u5) {
+                rcp: bool,
+                _unknown: u4
+            },
+            bits: u5
         },
-        bits: u5
+        timer_interrupt: bool
     },
-    timer_interrupt: bool
+    bits: u8
 };
 
 pub const Cop0StatusRegister = packed struct(u32) {
@@ -136,7 +175,20 @@ pub const Cop0StatusRegister = packed struct(u32) {
     //
 
     interrupt_mask: InterruptBits,
-    diagnostic_field: u9,
+    diagnostic_field: packed union {
+        flags: packed struct {
+            de: bool,
+            ce: bool,
+            cp0_condition_bit: bool,
+            _always_zero_0: bool,
+            soft_reset_or_nmi: bool,
+            tlb_shutdown: bool,
+            bootstrap_exception_vector: bool,
+            _always_zero_1: bool,
+            instruction_trace_enable: bool
+        },
+        bits: u9
+    },
 
     reverse_endian_user: bool,
     floating_point_registers_enable: bool,
@@ -165,17 +217,48 @@ pub const Cop0ConfigRegister = packed struct(u32) {
     _data1: u8,
     transfer_data_pattern: u4,
     operating_frequency_ratio: u3,
-    _always_zero: bool
+    _always_zero: u1
 };
 
 pub fn getConfigFlags() *Cop0ConfigRegister {
     return @ptrCast(*Cop0ConfigRegister, &cp0[@enumToInt(Cop0Register.config)]);
 }
 
-pub const InstructionBits = packed union {
-    instruction: Instruction,
-    bits: u32
+pub const ExcCode = enum(u5) {
+    interrupt = 0,
+    tlb_modification = 1,
+    tlb_miss_load = 2,
+    tlb_miss_store = 3,
+    address_error_load = 4,
+    address_error_store = 5,
+    bus_error_instruction_fetch = 6,
+    bus_error_load_store = 7,
+    syscall = 8,
+    breakpoint = 9,
+    reserved_instruction = 10,
+    coprocessor_unusable = 11,
+    overflow = 12,
+    trap = 13,
+    floating_point = 15,
+    watch = 23
 };
+
+pub const Cop0CauseRegister = packed struct(u32) {
+    _always_zero_0: u2,
+    exc_code: ExcCode,
+    _always_zero_1: u1,
+    interrupts_pending: InterruptBits,
+    _always_zero_2: u12,
+    coprocessor_number: u2,
+    _always_zero_3: u1,
+    branch_delay_slot: bool
+};
+
+pub fn getCauseFlags() *Cop0CauseRegister {
+    return @ptrCast(*Cop0CauseRegister, &cp0[@enumToInt(Cop0Register.cause)]);
+}
+
+pub var inst_count: u64 = 0;
 
 pub const Instruction = packed struct(u32) {
     pub const SpecialFunction = enum(u6) {
@@ -318,6 +401,11 @@ pub const Instruction = packed struct(u32) {
 
 // On the N64 the PC is really only 32-bit, even though the processor is technically capable of a 64-bit mode.
 pub var pc: u32 = 0;
+
+// Stores the PC before being changed / incremented by the ran instruction. 
+// Used for setting the EPC registers.
+var last_pc: u32 = 0;
+
 var branch_target: ?i32 = null;
 var jump_target: ?u32 = null;
 var jump_reg_target: ?u32 = null;
@@ -329,97 +417,105 @@ pub const CpuError = error {
     InvalidInstruction
 };
 
+inline fn overrideBranch() void {
+    branch_target = null;
+    jump_target = null;
+    jump_reg_target = null;
+    is_delay_slot = false;
+}
+
 pub inline fn virtualToPhysical(vAddr: u32) u32 {
     // TODO: Implement the TLB.
     return vAddr & 0x1FFFFFFF;
 }
 
-pub fn init(hle_pif: bool) void {
-    getConfigFlags().big_endian_enable = true;
+fn runHlePif() void {
+    getStatusFlags().coprocessor_enable.bits = 0b0011; // Enable Coprocessor 0 and 1.
+    getStatusFlags().floating_point_registers_enable = true; // Enable all floating-point registers.
 
-    if (hle_pif) {
-        getStatusFlags().coprocessor_enable.bits = 0b0011; // Enable Coprocessor 0 and 1.
-        getStatusFlags().floating_point_registers_enable = true; // Enable all floating-point registers.
+    getConfigFlags().kseg0_flags = 0b011; // Sets kseg0 to be uncached.
+    getConfigFlags().cu = false; // An unused bit that can be written to and read from.
 
-        getConfigFlags().kseg0_flags = 0b011; // Sets kseg0 to be uncached.
-        getConfigFlags().cu = false; // An unused bit that can be written to and read from.
-        getConfigFlags().big_endian_enable = true; // Enable Big-endian (also already the default at a cold reset)
+    // halt the RSP, clear interrupt
+    memory.rcp.rsp.reg_range_0.writeAligned(
+        @enumToInt(memory.rcp.rsp.RegRange0Offset.sp_status_reg), @as(u32, 0b1010)
+    );
 
-        // halt the RSP, clear interrupt
-        memory.rcp.rsp.reg_range_0.writeAligned(
-            @enumToInt(memory.rcp.rsp.RegRange0Offset.sp_status_reg), @as(u32, 0b1010)
-        );
+    // reset the PI, clear interrupt
+    memory.rcp.pi.reg_range.writeAligned(
+        @enumToInt(memory.rcp.pi.RegRangeOffset.pi_status_reg), @as(u32, 0b11)
+    );
+    
+    memory.rcp.vi.reg_range.writeAligned(
+        @enumToInt(memory.rcp.vi.RegRangeOffset.vi_intr_reg), @as(u32, 1023)
+    );
+    memory.rcp.vi.reg_range.writeAligned(
+        @enumToInt(memory.rcp.vi.RegRangeOffset.vi_current_reg), @as(u32, 0)
+    );
+    memory.rcp.vi.reg_range.writeAligned(
+        @enumToInt(memory.rcp.vi.RegRangeOffset.vi_h_start_reg), @as(u32, 0)
+    );
 
-        // reset the PI, clear interrupt
-        memory.rcp.pi.reg_range.writeAligned(
-            @enumToInt(memory.rcp.pi.RegRangeOffset.pi_status_reg), @as(u32, 0b11)
-        );
-        
-        memory.rcp.vi.reg_range.writeAligned(
-            @enumToInt(memory.rcp.vi.RegRangeOffset.vi_intr_reg), @as(u32, 1023)
-        );
-        memory.rcp.vi.reg_range.writeAligned(
-            @enumToInt(memory.rcp.vi.RegRangeOffset.vi_current_reg), @as(u32, 0)
-        );
-        memory.rcp.vi.reg_range.writeAligned(
-            @enumToInt(memory.rcp.vi.RegRangeOffset.vi_h_start_reg), @as(u32, 0)
-        );
+    memory.rcp.ai.reg_range.writeAligned(
+        @enumToInt(memory.rcp.ai.RegRangeOffset.ai_dram_addr_reg), @as(u32, 0)
+    );
+    memory.rcp.ai.reg_range.writeAligned(
+        @enumToInt(memory.rcp.ai.RegRangeOffset.ai_len_reg), @as(u32, 0)
+    );
 
-        memory.rcp.ai.reg_range.writeAligned(
-            @enumToInt(memory.rcp.ai.RegRangeOffset.ai_dram_addr_reg), @as(u32, 0)
-        );
-        memory.rcp.ai.reg_range.writeAligned(
-            @enumToInt(memory.rcp.ai.RegRangeOffset.ai_len_reg), @as(u32, 0)
-        );
+    // Parse pif24
+    var pif24 = memory.pif.ram.readAligned(u32, 0x24);
+    var rom_type = (pif24 >> 19) & 1;
+    var s7 = (pif24 >> 18) & 1;
+    var reset_type = (pif24 >> 17) & 1;
+    var seed = (pif24 >> 8) & 0xFF;
+    var tv_type: u32 = @enumToInt(system.config.tv_type);
+    gpr[19] = rom_type;
+    gpr[20] = tv_type;
+    gpr[21] = reset_type;
+    gpr[22] = seed;
+    gpr[23] = s7;
+    
+    // Write the cart timing configuration
+    var bsd_dom1_config = memory.cart.rom.readAligned(u32, 0);
+    memory.rcp.pi.reg_range.writeAligned(
+        @enumToInt(memory.rcp.pi.RegRangeOffset.pi_bsd_dom1_lat_reg), 
+        bsd_dom1_config & 0xFF
+    );
+    memory.rcp.pi.reg_range.writeAligned(
+        @enumToInt(memory.rcp.pi.RegRangeOffset.pi_bsd_dom1_pwd_reg), 
+        (bsd_dom1_config >> 8) & 0xFF
+    );
+    memory.rcp.pi.reg_range.writeAligned(
+        @enumToInt(memory.rcp.pi.RegRangeOffset.pi_bsd_dom1_pgs_reg), 
+        (bsd_dom1_config >> 16) & 0x0F
+    );
+    memory.rcp.pi.reg_range.writeAligned(
+        @enumToInt(memory.rcp.pi.RegRangeOffset.pi_bsd_dom1_rls_reg), 
+        (bsd_dom1_config >> 20) & 0b11
+    );
 
-        // Parse pif24
-        var pif24 = memory.pif.ram.readAligned(u32, 0x24);
-        var rom_type = (pif24 >> 19) & 1;
-        var s7 = (pif24 >> 18) & 1;
-        var reset_type = (pif24 >> 17) & 1;
-        var seed = (pif24 >> 8) & 0xFF;
-        var tv_type: u32 = 1; // NTSC (TODO: Make this configurable)
-        gpr[19] = rom_type;
-        gpr[20] = tv_type;
-        gpr[21] = reset_type;
-        gpr[22] = seed;
-        gpr[23] = s7;
-        
-        // Write the cart timing configuration
-        var bsd_dom1_config = memory.cart.rom.readAligned(u32, 0);
-        memory.rcp.pi.reg_range.writeAligned(
-            @enumToInt(memory.rcp.pi.RegRangeOffset.pi_bsd_dom1_lat_reg), bsd_dom1_config & 0xFF
-        );
-        memory.rcp.pi.reg_range.writeAligned(
-            @enumToInt(memory.rcp.pi.RegRangeOffset.pi_bsd_dom1_pwd_reg), (bsd_dom1_config >> 8) & 0xFF
-        );
-        memory.rcp.pi.reg_range.writeAligned(
-            @enumToInt(memory.rcp.pi.RegRangeOffset.pi_bsd_dom1_pgs_reg), (bsd_dom1_config >> 16) & 0x0F
-        );
-        memory.rcp.pi.reg_range.writeAligned(
-            @enumToInt(memory.rcp.pi.RegRangeOffset.pi_bsd_dom1_rls_reg), (bsd_dom1_config >> 20) & 0b11
-        );
+    // Copy IPL3 bootcode to RSP DMEM
+    std.mem.copy(u8, memory.rcp.rsp.dmem.buf[0x40..], memory.cart.rom.buf[0x40..0x1000]);
 
-        // Copy IPL3 bootcode to RSP DMEM
-        std.mem.copy(u8, memory.rcp.rsp.dmem.buf[0x40..], memory.cart.rom.buf[0x40..0x1000]);
+    // Required by CIC x105
+    memory.rcp.rsp.imem.writeAligned(0x00, @as(u32, 0x3c0dbfc0));
+    memory.rcp.rsp.imem.writeAligned(0x04, @as(u32, 0x8da807fc));
+    memory.rcp.rsp.imem.writeAligned(0x08, @as(u32, 0x25ad07c0));
+    memory.rcp.rsp.imem.writeAligned(0x0C, @as(u32, 0x31080080));
+    memory.rcp.rsp.imem.writeAligned(0x10, @as(u32, 0x5500fffc));
+    memory.rcp.rsp.imem.writeAligned(0x14, @as(u32, 0x3c0dbfc0));
+    memory.rcp.rsp.imem.writeAligned(0x18, @as(u32, 0x8da80024));
+    memory.rcp.rsp.imem.writeAligned(0x1C, @as(u32, 0x3c0bb000));
+    gpr[11] = 0xFFFFFFFFA0000000 + @as(u64, cpu_bus.sp_dmem_base_addr) + 0x40;
+    gpr[29] = 0xFFFFFFFFA0000000 + @as(u64, cpu_bus.sp_imem_base_addr) + 0xff0;
+    gpr[31] = 0xFFFFFFFFA0000000 + @as(u64, cpu_bus.sp_imem_base_addr) + 0x550;
 
-        // Required by CIC x105
-        memory.rcp.rsp.imem.writeAligned(0x00, @as(u32, 0x3c0dbfc0));
-        memory.rcp.rsp.imem.writeAligned(0x04, @as(u32, 0x8da807fc));
-        memory.rcp.rsp.imem.writeAligned(0x08, @as(u32, 0x25ad07c0));
-        memory.rcp.rsp.imem.writeAligned(0x0C, @as(u32, 0x31080080));
-        memory.rcp.rsp.imem.writeAligned(0x10, @as(u32, 0x5500fffc));
-        memory.rcp.rsp.imem.writeAligned(0x14, @as(u32, 0x3c0dbfc0));
-        memory.rcp.rsp.imem.writeAligned(0x18, @as(u32, 0x8da80024));
-        memory.rcp.rsp.imem.writeAligned(0x1C, @as(u32, 0x3c0bb000));
-        gpr[11] = 0xFFFFFFFFA0000000 + @as(u64, io_map.sp_dmem_base_addr) + 0x40;
-        gpr[29] = 0xFFFFFFFFA0000000 + @as(u64, io_map.sp_imem_base_addr) + 0xff0;
-        gpr[31] = 0xFFFFFFFFA0000000 + @as(u64, io_map.sp_imem_base_addr) + 0x550;
+    pc = 0xA0000000 + cpu_bus.sp_dmem_base_addr + 0x40;
+}
 
-        pc = 0xA0000000 + io_map.sp_dmem_base_addr + 0x40;
-    } else {
-        pc = io_map.pif_boot_rom_base_addr;
-    }
+pub fn init() void {
+    cop0.raiseColdReset();
 }
 
 pub fn step() CpuError!void {
@@ -427,14 +523,43 @@ pub fn step() CpuError!void {
     getConfigFlags().operating_frequency_ratio = 0; // I don't know what this is supposed to be.
     getConfigFlags()._data0 = 0b11001000110;
     getConfigFlags()._data1 = 0b00000110;
-    getConfigFlags()._always_zero = false;
+    getConfigFlags()._always_zero = 0;
 
-    var instruction_ptr = io_map.getWordPtr(pc & 0x1FFFFFFF);
+    // TODO: Emulate this better?
+    // Unfortunately there's no way to accurately emulate the Cycle Count register
+    // without making the emulated CPU be cycle-accurate (a la Cen64)
+    // but there could be a better way to do this depending on how games want to use it.
+    //
+    // In any case, for non-cycle-accurate emulators, this is indeed a hard thing to emulate
+    // and I've noticed some emulators even change the amount to increment 
+    // based off the game manually as a hack!!! (something I'd like to avoid)
+    //
+    // Anyway, for now this should work fine.
+    const cp0_count = @truncate(u32, inst_count);
+    cp0[@enumToInt(Cop0Register.count)] = cp0_count;
+    if (cp0_count == cp0[@enumToInt(Cop0Register.compare)]) {
+        getCauseFlags().interrupts_pending.flags.timer_interrupt = true;
+    }
+
+    var instruction_ptr = cpu_bus.getWordPtr(virtualToPhysical(pc));
     std.debug.assert(instruction_ptr != null);
-    var inst = InstructionBits { 
-        .bits = instruction_ptr.?.*
-    };
-    try interpreter.executeInstruction(inst.instruction);
+    last_pc = pc;
+    try interpreter.executeInstruction(@ptrCast(*align(1) Instruction, instruction_ptr.?).*);
+    inst_count +%= 1; // Shouldn't roll over in about 6,000 years
+    // (in contrast to a 32-bit number which will roll over in 40 seconds, both numbers assuming 93.75MHz)
+
+    // Handle interrupts.
+    if (getStatusFlags().interrupt_enable and !(getStatusFlags().is_exception or getStatusFlags().is_error)) {
+        if (getCauseFlags().interrupts_pending.bits & getStatusFlags().interrupt_mask.bits > 0) {
+            cop0.raiseCommonException(.interrupt);
+        }
+    }
+
+    // Handle exceptions (including interrupt exceptions).
+    if (cop0.current_exception != null) {
+        cop0.jumpToExceptionHandler();
+        cop0.current_exception = null;
+    }
 
     // Handle jumps and branches.
     if ((jump_target != null or branch_target != null or jump_reg_target != null) and !is_delay_slot) {
@@ -448,11 +573,136 @@ pub fn step() CpuError!void {
         jump_reg_target = null;
         is_delay_slot = false;
     } else if (branch_target != null and is_delay_slot) {
-        pc = (pc - 4) +% @bitCast(u32, branch_target.?);
+        pc = (pc - 4) +% @bitCast(u32, branch_target.?); // Relative to delay slot instruction.
         branch_target = null;
         is_delay_slot = false;
     }
 }
+
+pub const cop0 = struct {
+    // This is sorted in order of priority, with the top exceptions 
+    // taking priority over the lower exceptions if happening on the same CPU cycle.
+    pub const ExceptionType = enum(u8) {
+        cold_reset,
+        soft_reset_or_nmi,
+        address_error_instruction_fetch,
+        tlb_miss_instruction_fetch,
+        tlb_invalid_instruction_fetch,
+        bus_error_instruction_fetch,
+        syscall,
+        breakpoint,
+        coprocessor_unusable,
+        reserved_instruction,
+        trap,
+        overflow,
+        floating_point,
+        address_error_load,
+        address_error_store,
+        tlb_miss_load,
+        tlb_miss_store,
+        tlb_modification,
+        watch, // TODO: Emulate postponing behaviour when EXL is set. (Probably not necessary though)
+        bus_error_load_store,
+        interrupt
+    };
+    pub var current_exception: ?ExceptionType = null;
+
+    inline fn typeToExcCode(t: ExceptionType) !ExcCode {
+        return switch(t) {
+            .address_error_instruction_fetch => .address_error_load,
+            .tlb_miss_instruction_fetch => .tlb_miss_load,
+            .tlb_invalid_instruction_fetch => .tlb_miss_load,
+            .bus_error_instruction_fetch => .bus_error_instruction_fetch,
+            .syscall => .syscall,
+            .breakpoint => .breakpoint,
+            .coprocessor_unusable => .coprocessor_unusable,
+            .reserved_instruction => .reserved_instruction,
+            .trap => .trap,
+            .overflow => .overflow,
+            .floating_point => .floating_point,
+            .address_error_load => .address_error_load,
+            .address_error_store => .address_error_store,
+            .tlb_miss_load => .tlb_miss_load,
+            .tlb_miss_store => .tlb_miss_store,
+            .tlb_modification => .tlb_modification,
+            .watch => .watch,
+            .bus_error_load_store => .bus_error_load_store,
+            .interrupt => .interrupt,
+            else => error.InvalidArgs
+        };
+    }
+
+    pub fn raiseColdReset() void {
+        if (current_exception != null and @enumToInt(ExceptionType.cold_reset) > @enumToInt(current_exception.?)) return;
+
+        getConfigFlags().big_endian_enable = true;
+        getConfigFlags().transfer_data_pattern = 0;
+        cp0[@enumToInt(Cop0Register.random)] = 31;
+        cp0[@enumToInt(Cop0Register.wired)] = 0;
+        getStatusFlags().low_power_mode = false;
+        getStatusFlags().diagnostic_field.flags.tlb_shutdown = false;
+        getStatusFlags().diagnostic_field.flags.soft_reset_or_nmi = false;
+        getStatusFlags().is_error = true;
+
+        current_exception = .cold_reset;
+    }
+
+    pub fn raiseSoftResetOrNmi() void {
+        if (system.config.hle_pif) {
+            log.warn("Cannot raise a soft reset / NMI with an HLE PIF currently.");
+            return;
+        }
+        if (current_exception != null and @enumToInt(ExceptionType.soft_reset_or_nmi) > @enumToInt(current_exception.?)) return;
+
+        getStatusFlags().low_power_mode = false;
+        getStatusFlags().diagnostic_field.flags.tlb_shutdown = false;
+        getStatusFlags().diagnostic_field.flags.soft_reset_or_nmi = true;
+        getStatusFlags().is_error = true;
+
+        current_exception = .soft_reset_or_nmi;
+    }
+
+    pub fn raiseCommonException(t: ExceptionType) void {
+        if (current_exception != null and @enumToInt(t) > @enumToInt(current_exception.?)) return;
+
+        getCauseFlags().exc_code = typeToExcCode(t) catch {
+            log.err("Cannot raise a common exception for a non-common exception type!", .{ });
+            return;
+        };
+
+        current_exception = t;
+    }
+
+    // This function assumes that you've already set all the 
+    // relevant registers describing the kind of exception and exception info.
+    inline fn jumpToExceptionHandler() void {
+        if (!getStatusFlags().is_error) {
+            var vector_offset: u32 = 0x000;
+            if (!getStatusFlags().is_exception) {
+                getCauseFlags().branch_delay_slot = is_delay_slot;
+                cp0[@enumToInt(Cop0Register.epc)] = switch(is_delay_slot) {
+                    true => last_pc - 4,
+                    false => last_pc
+                };
+            } else {
+                vector_offset = 0x180;
+            }
+            getStatusFlags().is_exception = true;
+            pc = switch (getStatusFlags().diagnostic_field.flags.bootstrap_exception_vector) {
+                true => 0xBFC00200 + vector_offset,
+                false => 0x80000000 + vector_offset
+            };
+        } else {
+            getStatusFlags().diagnostic_field.flags.bootstrap_exception_vector = true;
+            cp0[@enumToInt(Cop0Register.errorepc)] = last_pc;
+            pc = 0xBFC00000;
+            if (system.config.hle_pif) {
+                runHlePif();
+            }
+        }
+        overrideBranch();
+    }
+};
 
 const interpreter = struct {
     const opcode_lookup = init: { 
@@ -600,13 +850,13 @@ const interpreter = struct {
         const r_type = inst.data.r_type;
         var rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
         var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
-        var result: i32 = 0;
-        if (@addWithOverflow(i32, rs, rt, &result)) {
-            log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+        var result = @addWithOverflow(rs, rt);
+        if (result.@"1" == 1) {
+            cop0.raiseCommonException(.overflow);
             pc += 4;
             return;
         }
-        gpr[r_type.rd] = @bitCast(u64, @as(i64, result));
+        gpr[r_type.rd] = @bitCast(u64, @as(i64, result.@"0"));
         pc += 4;
     }
 
@@ -614,13 +864,13 @@ const interpreter = struct {
         const i_type = inst.data.i_type;
         var rs = @truncate(i32, @bitCast(i64, gpr[i_type.rs]));
         var immediate = @as(i32, @bitCast(i16, i_type.immediate));
-        var result: i32 = 0;
-        if (@addWithOverflow(i32, rs, immediate, &result)) {
-            log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+        var result = @addWithOverflow(rs, immediate);
+        if (result.@"1" == 1) {
+            cop0.raiseCommonException(.overflow);
             pc += 4;
             return;
         }
-        gpr[i_type.rt] = @bitCast(u64, @as(i64, result));
+        gpr[i_type.rt] = @bitCast(u64, @as(i64, result.@"0"));
         pc += 4;
     }
 
@@ -958,26 +1208,26 @@ const interpreter = struct {
 
     fn instDadd(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
-        var result: i64 = 0;
-        if (@addWithOverflow(i64, @bitCast(i64, gpr[r_type.rs]), @bitCast(i64, gpr[r_type.rt]), &result)) {
-            log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+        var result = @addWithOverflow(@bitCast(i64, gpr[r_type.rs]), @bitCast(i64, gpr[r_type.rt]));
+        if (result.@"1" == 1) {
+            cop0.raiseCommonException(.overflow);
             pc += 4;
             return;
         }
-        gpr[r_type.rd] = @bitCast(u64, result);
+        gpr[r_type.rd] = @bitCast(u64, result.@"0");
         pc += 4;
     }
 
     fn instDaddi(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type;
         var immediate = @as(i64, @bitCast(i16, i_type.immediate));
-        var result: i64 = 0;
-        if (@addWithOverflow(i64, @bitCast(i64, gpr[i_type.rs]), immediate, &result)) {
-            log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+        var result = @addWithOverflow(@bitCast(i64, gpr[i_type.rs]), immediate);
+        if (result.@"1" == 1) {
+            cop0.raiseCommonException(.overflow);
             pc += 4;
             return;
         }
-        gpr[i_type.rt] = @bitCast(u64, result);
+        gpr[i_type.rt] = @bitCast(u64, result.@"0");
         pc += 4;
     }
 
@@ -1128,13 +1378,13 @@ const interpreter = struct {
 
     fn instDsub(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
-        var result: i64 = 0;
-        if (@subWithOverflow(i64, @bitCast(i64, gpr[r_type.rs]), @bitCast(i64, gpr[r_type.rt]), &result)) {
-            log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+        var result = @subWithOverflow(@bitCast(i64, gpr[r_type.rs]), @bitCast(i64, gpr[r_type.rt]));
+        if (result.@"1" == 1) {
+            cop0.raiseCommonException(.overflow);
             pc += 4;
             return;
         }
-        gpr[r_type.rd] = @bitCast(u64, result);
+        gpr[r_type.rd] = @bitCast(u64, result.@"0");
         pc += 4;
     }
 
@@ -1199,7 +1449,7 @@ const interpreter = struct {
     fn instLb(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        var result = io_map.readAligned(u8, physical_address);
+        var result = cpu_bus.readAligned(u8, physical_address);
         gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i8, result)));
         pc += 4;
     }
@@ -1207,33 +1457,37 @@ const interpreter = struct {
     fn instLbu(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        var result = io_map.readAligned(u8, physical_address);
+        var result = cpu_bus.readAligned(u8, physical_address);
         gpr[i_type.rt] = result;
         pc += 4;
     }
 
     fn instLd(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        if (physical_address & 0b111 != 0) {
-            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+        const address = calculateAddress(i_type.base, i_type.offset);
+        if (address & 0b111 != 0) {
+            cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
+            cop0.raiseCommonException(.address_error_load);
             pc += 4;
             return;
         }
-        gpr[i_type.rt] = io_map.readAligned(u64, physical_address);
+        const physical_address = virtualToPhysical(address);
+        gpr[i_type.rt] = cpu_bus.readAligned(u64, physical_address);
         pc += 4;
     }
 
     fn instLdc1(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        if (physical_address & 0b111 != 0) {
-            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+        const address = calculateAddress(i_type.base, i_type.offset);
+        if (address & 0b111 != 0) {
+            cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
+            cop0.raiseCommonException(.address_error_load);
             pc += 4;
             return;
         }
+        const physical_address = virtualToPhysical(address);
         // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
-        fpr[i_type.rt] = io_map.readAligned(u64, physical_address);
+        fpr[i_type.rt] = cpu_bus.readAligned(u64, physical_address);
         pc += 4;
     }
 
@@ -1241,25 +1495,29 @@ const interpreter = struct {
 
     fn instLh(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        if (physical_address & 0b1 != 0) {
-            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+        const address = calculateAddress(i_type.base, i_type.offset);
+        if (address & 0b1 != 0) {
+            cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
+            cop0.raiseCommonException(.address_error_load);
             pc += 4;
             return;
         }
-        gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i16, io_map.readAligned(u16, physical_address))));
+        const physical_address = virtualToPhysical(address);
+        gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i16, cpu_bus.readAligned(u16, physical_address))));
         pc += 4;
     }
 
     fn instLhu(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        if (physical_address & 0b1 != 0) {
-            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+        const address = calculateAddress(i_type.base, i_type.offset);
+        if (address & 0b1 != 0) {
+            cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
+            cop0.raiseCommonException(.address_error_load);
             pc += 4;
             return;
         }
-        gpr[i_type.rt] = io_map.readAligned(u16, physical_address);
+        const physical_address = virtualToPhysical(address);
+        gpr[i_type.rt] = cpu_bus.readAligned(u16, physical_address);
         pc += 4;
     }
 
@@ -1271,26 +1529,30 @@ const interpreter = struct {
 
     fn instLw(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        if (physical_address & 0b11 != 0) {
-            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+        const address = calculateAddress(i_type.base, i_type.offset);
+        if (address & 0b11 != 0) {
+            cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
+            cop0.raiseCommonException(.address_error_load);
             pc += 4;
             return;
         }
-        gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i32, io_map.readAligned(u32, physical_address))));
+        const physical_address = virtualToPhysical(address);
+        gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i32, cpu_bus.readAligned(u32, physical_address))));
         pc += 4;
     }
 
     fn instLwc1(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        if (physical_address & 0b11 != 0) {
-            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+        const address = calculateAddress(i_type.base, i_type.offset);
+        if (address & 0b11 != 0) {
+            cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
+            cop0.raiseCommonException(.address_error_load);
             pc += 4;
             return;
         }
+        const physical_address = virtualToPhysical(address);
         // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
-        fpr[i_type.rt] = io_map.readAligned(u32, physical_address);
+        fpr[i_type.rt] = cpu_bus.readAligned(u32, physical_address);
         pc += 4;
     }
 
@@ -1298,13 +1560,15 @@ const interpreter = struct {
 
     fn instLwu(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        if (physical_address & 0b11 != 0) {
-            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+        const address = calculateAddress(i_type.base, i_type.offset);
+        if (address & 0b11 != 0) {
+            cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
+            cop0.raiseCommonException(.address_error_load);
             pc += 4;
             return;
         }
-        gpr[i_type.rt] = io_map.readAligned(u32, physical_address);
+        const physical_address = virtualToPhysical(address);
+        gpr[i_type.rt] = cpu_bus.readAligned(u32, physical_address);
         pc += 4;
     }
 
@@ -1334,7 +1598,27 @@ const interpreter = struct {
     
     inline fn instMtc0(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type_cop;
-        cp0[r_type.rd] = @truncate(u32, gpr[r_type.rt]);
+        if (r_type.rd == @enumToInt(Cop0Register.context)) {
+            cp0[r_type.rd] = (@truncate(u32, gpr[r_type.rt]) & cp0_write_mask[r_type.rd]) 
+                | (cp0[r_type.rd] & 0x007FFFF0);
+        } else if (r_type.rd == @enumToInt(Cop0Register.wired)) {
+            cp0[r_type.rd] = @truncate(u32, gpr[r_type.rt]);
+            cp0[@enumToInt(Cop0Register.random)] = 31;
+        } else if (r_type.rd == @enumToInt(Cop0Register.compare)) {
+            getCauseFlags().interrupts_pending.flags.timer_interrupt = false;
+            cp0[r_type.rd] = @truncate(u32, gpr[r_type.rt]);
+        } else if (r_type.rd == @enumToInt(Cop0Register.cause)) {
+            cp0[r_type.rd] &= ~cp0_write_mask[r_type.rd];
+            cp0[r_type.rd] |= @truncate(u32, gpr[r_type.rt]) & cp0_write_mask[r_type.rd];
+        } else if (r_type.rd == @enumToInt(Cop0Register.taghi)) {
+            cp0[r_type.rd] = 0;
+        } else {
+            if (cp0_write_mask[r_type.rd] == 0) {
+                pc += 4;
+                return;
+            }
+            cp0[r_type.rd] = @truncate(u32, gpr[r_type.rt]) & cp0_write_mask[r_type.rd];
+        }
         pc += 4;
     }
 
@@ -1395,32 +1679,36 @@ const interpreter = struct {
     fn instSb(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        io_map.writeAligned(physical_address, @truncate(u8, gpr[i_type.rt]));
+        cpu_bus.writeAligned(physical_address, @truncate(u8, gpr[i_type.rt]));
         pc += 4;
     }
 
     fn instSd(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        if (physical_address & 0b111 != 0) {
-            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+        const address = calculateAddress(i_type.base, i_type.offset);
+        if (address & 0b111 != 0) {
+            cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
+            cop0.raiseCommonException(.address_error_store);
             pc += 4;
             return;
         }
-        io_map.writeAligned(physical_address, gpr[i_type.rt]);
+        const physical_address = virtualToPhysical(address);
+        cpu_bus.writeAligned(physical_address, gpr[i_type.rt]);
         pc += 4;
     }
 
     fn instSdc1(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        if (physical_address & 0b111 != 0) {
-            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+        const address = calculateAddress(i_type.base, i_type.offset);
+        if (address & 0b111 != 0) {
+            cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
+            cop0.raiseCommonException(.address_error_store);
             pc += 4;
             return;
         }
+        const physical_address = virtualToPhysical(address);
         // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
-        io_map.writeAligned(physical_address, fpr[i_type.rt]);
+        cpu_bus.writeAligned(physical_address, fpr[i_type.rt]);
         pc += 4;
     }
 
@@ -1428,13 +1716,15 @@ const interpreter = struct {
 
     fn instSh(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        if (physical_address & 0b1 != 0) {
-            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+        const address = calculateAddress(i_type.base, i_type.offset);
+        if (address & 0b1 != 0) {
+            cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
+            cop0.raiseCommonException(.address_error_store);
             pc += 4;
             return;
         }
-        io_map.writeAligned(physical_address, @truncate(u16, gpr[i_type.rt]));
+        const physical_address = virtualToPhysical(address);
+        cpu_bus.writeAligned(physical_address, @truncate(u16, gpr[i_type.rt]));
         pc += 4;
     }
 
@@ -1508,13 +1798,13 @@ const interpreter = struct {
         const r_type = inst.data.r_type;
         var rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
         var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
-        var result: i32 = 0;
-        if (@subWithOverflow(i32, rs, rt, &result)) {
-            log.warn("TODO: Throw Integer Overflow exception in the R4300 CPU.", .{ });
+        var result = @subWithOverflow(rs, rt);
+        if (result.@"1" == 1) {
+            cop0.raiseCommonException(.overflow);
             pc += 4;
             return;
         }
-        gpr[r_type.rd] = @bitCast(u64, @as(i64, result));
+        gpr[r_type.rd] = @bitCast(u64, @as(i64, result.@"0"));
         pc += 4;
     }
 
@@ -1528,26 +1818,30 @@ const interpreter = struct {
 
     fn instSw(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        if (physical_address & 0b11 != 0) {
-            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+        const address = calculateAddress(i_type.base, i_type.offset);
+        if (address & 0b11 != 0) {
+            cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
+            cop0.raiseCommonException(.address_error_store);
             pc += 4;
             return;
         }
-        io_map.writeAligned(physical_address, @truncate(u32, gpr[i_type.rt]));
+        const physical_address = virtualToPhysical(address);
+        cpu_bus.writeAligned(physical_address, @truncate(u32, gpr[i_type.rt]));
         pc += 4;
     }
 
     fn instSwc1(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
-        var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
-        if (physical_address & 0b11 != 0) {
-            log.warn("TODO: Throw Address Exception on the R4300 CPU.", .{ });
+        const address = calculateAddress(i_type.base, i_type.offset);
+        if (address & 0b11 != 0) {
+            cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
+            cop0.raiseCommonException(.address_error_store);
             pc += 4;
             return;
         }
+        const physical_address = virtualToPhysical(address);
         // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
-        io_map.writeAligned(physical_address, @truncate(u32, fpr[i_type.rt]));
+        cpu_bus.writeAligned(physical_address, @truncate(u32, fpr[i_type.rt]));
         pc += 4;
     }
 

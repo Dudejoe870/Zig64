@@ -1,7 +1,7 @@
 const std = @import("std");
 const memory = @import("memory.zig");
 
-const log = std.log.scoped(.io_map);
+const log = std.log.scoped(.cpu_bus);
 
 pub const rdram_base_addr: u32 = 0x00000000;
 pub const rdram_reg_base_addr: u32 = 0x03f00000;

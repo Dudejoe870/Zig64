@@ -31,13 +31,30 @@ pub fn main() !u8 {
     var arg_it = try std.process.argsWithAllocator(arena.allocator());
     _ = arg_it.skip();
 
+    var config: system.Config = undefined;
+
+    const tv_type = arg_it.next() orelse {
+        std.log.err("Expected first argument to be the region to emulate", .{ });
+        return error.InvalidArgs;
+    };
+    if (std.mem.eql(u8, tv_type, "ntsc")) {
+        config.tv_type = .ntsc;
+    } else if (std.mem.eql(u8, tv_type, "pal")) {
+        config.tv_type = .pal;
+    } else if (std.mem.eql(u8, tv_type, "mpal")) {
+        config.tv_type = .mpal;
+    } else {
+        std.log.err("Expected first argument to be the region to emulate", .{ });
+        return error.InvalidArgs;
+    }
+
     const rom = arg_it.next() orelse {
-        std.log.err("Expected first argument to be rom to run", .{ });
+        std.log.err("Expected second argument to be rom to run", .{ });
         return error.InvalidArgs;
     };
     const pif = arg_it.next();
 
-    try runEmulator(pif, rom);
+    try runEmulator(pif, rom, config);
     return 0;
 }
 
@@ -49,8 +66,8 @@ fn runSystem() !void {
     }
 }
 
-fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8) !void {
-    try system.init(bootrom_path, rom_path);
+fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8, config: system.Config) !void {
+    try system.init(bootrom_path, rom_path, config);
 
     var system_thread = try std.Thread.spawn(.{ }, runSystem, .{ });
     try system_thread.setName("Emulator Thread");

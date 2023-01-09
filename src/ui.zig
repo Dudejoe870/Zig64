@@ -2,7 +2,7 @@ const std = @import("std");
 const c = @import("c.zig");
 
 const system = @import("system.zig");
-const io_map = @import("io_map.zig");
+const cpu_bus = @import("cpu_bus.zig");
 const r4300 = @import("r4300.zig");
 
 var text_buffer: [1024]u8 = undefined;
@@ -41,6 +41,9 @@ fn renderSystemControl() !void {
             }
             c.igEndCombo();
         }
+
+        c.igTextUnformatted((try std.fmt.bufPrint(text_buffer[0..], 
+            "VI/s {d}\x00", .{ system.vi.vis_per_second })).ptr, null);
     }
     c.igEnd();
 }
