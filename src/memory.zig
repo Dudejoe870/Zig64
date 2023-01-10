@@ -264,12 +264,11 @@ pub const rcp = struct {
                 }
 
                 // MI interrupt bit
-                var mi_intr_reg = rcp.mi.reg_range.getWordPtr(@enumToInt(rcp.mi.RegRangeOffset.mi_intr_reg));
                 if (effective_value & 0b01000 != 0) { // Clear
-                    mi_intr_reg.* &= ~@as(u32, 0b01);
+                    rcp.mi.getMiInterruptFlags().sp = false;
                 }
                 if (effective_value & 0b10000 != 0) { // Set
-                    mi_intr_reg.* |= 0b01;
+                    rcp.mi.getMiInterruptFlags().sp = true;
                 }
 
                 // Single-step bit
@@ -406,9 +405,31 @@ pub const rcp = struct {
             mi_intr_mask_reg = 0x0C
         };
 
-        fn miWriteEvent(offset: u32, _: u32, _: u32) bool {
+        pub const MiInterruptBits = packed struct(u32) {
+            sp: bool,
+            si: bool,
+            ai: bool,
+            vi: bool,
+            pi: bool,
+            dp: bool,
+            _always_zero: u26
+        };
+
+        pub fn getMiInterruptFlags() *align(1) MiInterruptBits {
+            return @ptrCast(*align(1) MiInterruptBits, reg_range.getWordPtr(@enumToInt(RegRangeOffset.mi_intr_reg)));
+        }
+
+        pub fn getMiMaskFlags() *align(1) MiInterruptBits {
+            return @ptrCast(*align(1) MiInterruptBits, reg_range.getWordPtr(@enumToInt(RegRangeOffset.mi_intr_mask_reg)));
+        }
+
+        fn miWriteEvent(offset: u32, value: u32, mask: u32) bool {
+            const effective_value = value & mask;
             if (offset == @enumToInt(RegRangeOffset.mi_intr_mask_reg)) {
-                // TODO: Implement MI_INTR_MASK_REG behaviour.
+                // SP mask
+                if (effective_value & 0b01 > 0) { // Clear
+                    getMiMaskFlags().sp = false;
+                }
             }
             return false;
         }
@@ -482,13 +503,13 @@ pub const rcp = struct {
             _ = value;
             _ = mask;
             if (offset == @enumToInt(RegRangeOffset.vi_current_reg)) {
-                var mi_intr_reg = rcp.mi.reg_range.getWordPtr(@enumToInt(rcp.mi.RegRangeOffset.mi_intr_reg));
-                mi_intr_reg.* &= ~@as(u32, 0b1000);
+                rcp.mi.getMiInterruptFlags().vi = false;
+                return false;
             }
             return true;
         }
 
-        pub inline fn getViStatusFlags() *align(1) ViStatusRegister {
+        pub fn getViStatusFlags() *align(1) ViStatusRegister {
             return @ptrCast(*align(1) ViStatusRegister, reg_range.getWordPtr(
                 @enumToInt(RegRangeOffset.vi_status_reg)));
         }
@@ -543,9 +564,8 @@ pub const rcp = struct {
                     // TODO: PIF controller stuff.
                 }
 
-                var mi_intr_reg = rcp.mi.reg_range.getWordPtr(@enumToInt(rcp.mi.RegRangeOffset.mi_intr_reg));
                 if (effective_value & 0b10 != 0) { // Clear MI Interrupt bit
-                    mi_intr_reg.* &= ~@as(u32, 0b10000);
+                    rcp.mi.getMiInterruptFlags().pi = false;
                 }
                 return false;
             } else if (offset == @enumToInt(RegRangeOffset.pi_wr_len_reg)) {

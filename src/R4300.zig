@@ -106,7 +106,7 @@ pub const Cop0Register = enum(u8) {
     _reserved10
 };
 const cp0_write_mask = [32]u32 {
-    0x8000003F, // index
+    0x0000003F, // index
     0x00000000, // random
     0x3FFFFFFF, // entrylo0
     0x3FFFFFFF, // entrylo1
@@ -118,8 +118,8 @@ const cp0_write_mask = [32]u32 {
     0x00000000, // count
     0xFFFFE0FF, // entryhi
     0xFFFFFFFF, // compare (also has special handling in mtc0)
-    0xFFFFFFFF, // status
-    0x00008300, // cause (also has special handling in mtc0)
+    0xFFFFFF1F, // status
+    0x00000300, // cause (also has special handling in mtc0)
     0xFFFFFFFF, // epc
     0x00000000, // previd
     0xFFFFFFFF, // config
@@ -144,13 +144,8 @@ pub const InterruptBits = packed union {
     flags: packed struct(u8) {
         software_interrupt0: bool,
         software_interrupt1: bool,
-        external: packed union {
-            flags: packed struct(u5) {
-                rcp: bool,
-                _unknown: u4
-            },
-            bits: u5
-        },
+        rcp: bool,
+        _unused: u4,
         timer_interrupt: bool
     },
     bits: u8
@@ -175,34 +170,28 @@ pub const Cop0StatusRegister = packed struct(u32) {
     //
 
     interrupt_mask: InterruptBits,
-    diagnostic_field: packed union {
-        flags: packed struct {
-            de: bool,
-            ce: bool,
-            cp0_condition_bit: bool,
-            _always_zero_0: bool,
-            soft_reset_or_nmi: bool,
-            tlb_shutdown: bool,
-            bootstrap_exception_vector: bool,
-            _always_zero_1: bool,
-            instruction_trace_enable: bool
-        },
-        bits: u9
+    diagnostic_field: packed struct(u9) {
+        de: bool,
+        ce: bool,
+        cp0_condition_bit: bool,
+        _always_zero_0: bool,
+        soft_reset_or_nmi: bool,
+        tlb_shutdown: bool,
+        bootstrap_exception_vector: bool,
+        _always_zero_1: bool,
+        instruction_trace_enable: bool
     },
 
     reverse_endian_user: bool,
     floating_point_registers_enable: bool,
     low_power_mode: bool,
 
-    coprocessor_enable: packed union {
-        flags: packed struct {
-            cop0_enable: bool,
-            cop1_enable: bool,
-            cop2_enable: bool,
-            cop3_enable: bool
-        },
-        bits: u4
-    }
+    coprocessor_enable: packed struct(u4) {
+        cop0_enable: bool,
+        cop1_enable: bool,
+        cop2_enable: bool,
+        cop3_enable: bool
+    },
 };
 
 pub fn getStatusFlags() *Cop0StatusRegister {
@@ -430,11 +419,17 @@ pub inline fn virtualToPhysical(vAddr: u32) u32 {
 }
 
 fn runHlePif() void {
-    getStatusFlags().coprocessor_enable.bits = 0b0011; // Enable Coprocessor 0 and 1.
+    cp0[@enumToInt(Cop0Register.status)] = 0x000000E0; // PIF rom overwrites it (three bits are always set)
+    // Enable Coprocessor 1.
+    getStatusFlags().coprocessor_enable.cop1_enable = true;
     getStatusFlags().floating_point_registers_enable = true; // Enable all floating-point registers.
 
     getConfigFlags().kseg0_flags = 0b011; // Sets kseg0 to be uncached.
     getConfigFlags().cu = false; // An unused bit that can be written to and read from.
+
+    cp0[@enumToInt(Cop0Register.errorepc)] = 0xFFFFFFFF;
+    cp0[@enumToInt(Cop0Register.previd)] = 0xB22;
+    cp0[@enumToInt(Cop0Register.epc)] = 0xFFFFFFFF;
 
     // halt the RSP, clear interrupt
     memory.rcp.rsp.reg_range_0.writeAligned(
@@ -520,10 +515,6 @@ pub fn init() void {
 
 pub fn step() CpuError!void {
     gpr[0] = 0;
-    getConfigFlags().operating_frequency_ratio = 0; // I don't know what this is supposed to be.
-    getConfigFlags()._data0 = 0b11001000110;
-    getConfigFlags()._data1 = 0b00000110;
-    getConfigFlags()._always_zero = 0;
 
     // TODO: Emulate this better?
     // Unfortunately there's no way to accurately emulate the Cycle Count register
@@ -540,6 +531,13 @@ pub fn step() CpuError!void {
     if (cp0_count == cp0[@enumToInt(Cop0Register.compare)]) {
         getCauseFlags().interrupts_pending.flags.timer_interrupt = true;
     }
+
+    // Cause an RCP interrupt if we have a pending non-masked MI interrupt.
+    getCauseFlags().interrupts_pending.flags.rcp = 
+        (memory.rcp.mi.reg_range.getWordPtr(
+            @enumToInt(memory.rcp.mi.RegRangeOffset.mi_intr_reg)).* & 0b111111) & 
+        (memory.rcp.mi.reg_range.getWordPtr(
+            @enumToInt(memory.rcp.mi.RegRangeOffset.mi_intr_mask_reg)).* & 0b111111) > 0;
 
     var instruction_ptr = cpu_bus.getWordPtr(virtualToPhysical(pc));
     std.debug.assert(instruction_ptr != null);
@@ -636,13 +634,25 @@ pub const cop0 = struct {
         if (current_exception != null and @enumToInt(ExceptionType.cold_reset) > @enumToInt(current_exception.?)) return;
 
         getConfigFlags().big_endian_enable = true;
+        getConfigFlags().operating_frequency_ratio = 0b111;
+        getConfigFlags()._data0 = 0b11001000110;
+        getConfigFlags()._data1 = 0b00000110;
         getConfigFlags().transfer_data_pattern = 0;
+
         cp0[@enumToInt(Cop0Register.random)] = 31;
         cp0[@enumToInt(Cop0Register.wired)] = 0;
+        
         getStatusFlags().low_power_mode = false;
-        getStatusFlags().diagnostic_field.flags.tlb_shutdown = false;
-        getStatusFlags().diagnostic_field.flags.soft_reset_or_nmi = false;
+        getStatusFlags().diagnostic_field.bootstrap_exception_vector = true;
+        getStatusFlags().diagnostic_field.tlb_shutdown = false;
+        getStatusFlags().diagnostic_field.soft_reset_or_nmi = false;
         getStatusFlags().is_error = true;
+        
+        // According to PeterLemon's N64 test suite, these are all one. Which probably means 
+        // on the N64 they've removed any kind of this functionality probably to reduce cost.
+        getStatusFlags().is_64bit_kernel_address_space = true;
+        getStatusFlags().is_64bit_supervisor_address_space = true;
+        getStatusFlags().is_64bit_user_address_space = true;
 
         current_exception = .cold_reset;
     }
@@ -656,6 +666,7 @@ pub const cop0 = struct {
 
         getStatusFlags().low_power_mode = false;
         getStatusFlags().diagnostic_field.flags.tlb_shutdown = false;
+        getStatusFlags().diagnostic_field.bootstrap_exception_vector = true;
         getStatusFlags().diagnostic_field.flags.soft_reset_or_nmi = true;
         getStatusFlags().is_error = true;
 
@@ -688,12 +699,11 @@ pub const cop0 = struct {
                 vector_offset = 0x180;
             }
             getStatusFlags().is_exception = true;
-            pc = switch (getStatusFlags().diagnostic_field.flags.bootstrap_exception_vector) {
+            pc = switch (getStatusFlags().diagnostic_field.bootstrap_exception_vector) {
                 true => 0xBFC00200 + vector_offset,
                 false => 0x80000000 + vector_offset
             };
         } else {
-            getStatusFlags().diagnostic_field.flags.bootstrap_exception_vector = true;
             cp0[@enumToInt(Cop0Register.errorepc)] = last_pc;
             pc = 0xBFC00000;
             if (system.config.hle_pif) {
@@ -1427,23 +1437,27 @@ const interpreter = struct {
     fn instJ(inst: Instruction) CpuError!void {
         const j_type = inst.data.j_type;
         jump(j_type.target);
+        pc += 4;
     }
 
     fn instJal(inst: Instruction) CpuError!void {
         const j_type = inst.data.j_type;
         link();
         jump(j_type.target);
+        pc += 4;
     }
 
     fn instJalr(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         linkReg(r_type.rd);
         jumpReg(r_type.rs);
+        pc += 4;
     }
 
     fn instJr(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         jumpReg(r_type.rs);
+        pc += 4;
     }
 
     fn instLb(inst: Instruction) CpuError!void {

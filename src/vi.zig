@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const cpu_bus = @import("cpu_bus.zig");
+
 const memory = @import("memory.zig");
 const system = @import("system.zig");
 
@@ -58,7 +60,7 @@ pub fn step() !void {
         // TODO: Verify that two VI interrupts happen in interlaced modes on hardware?
         // Perhaps they only happen on the second field?
         if (current_counter == vi_intr & ~@as(u32, 0b1)) {
-            // TODO: VI Interrupt
+            memory.rcp.mi.getMiInterruptFlags().vi = true;
             vi_count += 1;
         }
     }
