@@ -265,10 +265,10 @@ pub const rcp = struct {
 
                 // MI interrupt bit
                 if (effective_value & 0b01000 != 0) { // Clear
-                    rcp.mi.getMiInterruptFlags().sp = false;
+                    rcp.mi.getMiInterruptFlags().flags.sp = false;
                 }
                 if (effective_value & 0b10000 != 0) { // Set
-                    rcp.mi.getMiInterruptFlags().sp = true;
+                    rcp.mi.getMiInterruptFlags().flags.sp = true;
                 }
 
                 // Single-step bit
@@ -405,14 +405,17 @@ pub const rcp = struct {
             mi_intr_mask_reg = 0x0C
         };
 
-        pub const MiInterruptBits = packed struct(u32) {
-            sp: bool,
-            si: bool,
-            ai: bool,
-            vi: bool,
-            pi: bool,
-            dp: bool,
-            _always_zero: u26
+        pub const MiInterruptBits = packed union {
+            flags: packed struct(u32) {
+                sp: bool,
+                si: bool,
+                ai: bool,
+                vi: bool,
+                pi: bool,
+                dp: bool,
+                _always_zero: u26
+            },
+            bits: u32
         };
 
         pub fn getMiInterruptFlags() *align(1) MiInterruptBits {
@@ -428,7 +431,50 @@ pub const rcp = struct {
             if (offset == @enumToInt(RegRangeOffset.mi_intr_mask_reg)) {
                 // SP mask
                 if (effective_value & 0b01 > 0) { // Clear
-                    getMiMaskFlags().sp = false;
+                    getMiMaskFlags().flags.sp = false;
+                }
+                if (effective_value & 0b10 > 0) { // Set
+                    getMiMaskFlags().flags.sp = true;
+                }
+
+                // SI mask
+                if (effective_value & 0b0100 > 0) { // Clear
+                    getMiMaskFlags().flags.si = false;
+                }
+                if (effective_value & 0b1000 > 0) { // Set
+                    getMiMaskFlags().flags.si = true;
+                }
+
+                // AI mask
+                if (effective_value & 0b010000 > 0) { // Clear
+                    getMiMaskFlags().flags.ai = false;
+                }
+                if (effective_value & 0b100000 > 0) { // Set
+                    getMiMaskFlags().flags.ai = true;
+                }
+
+                // VI mask
+                if (effective_value & 0b01000000 > 0) { // Clear
+                    getMiMaskFlags().flags.vi = false;
+                }
+                if (effective_value & 0b10000000 > 0) { // Set
+                    getMiMaskFlags().flags.vi = true;
+                }
+
+                // PI mask
+                if (effective_value & 0b0100000000 > 0) { // Clear
+                    getMiMaskFlags().flags.pi = false;
+                }
+                if (effective_value & 0b1000000000 > 0) { // Set
+                    getMiMaskFlags().flags.pi = true;
+                }
+
+                // DP mask
+                if (effective_value & 0b010000000000 > 0) { // Clear
+                    getMiMaskFlags().flags.dp = false;
+                }
+                if (effective_value & 0b100000000000 > 0) { // Set
+                    getMiMaskFlags().flags.dp = true;
                 }
             }
             return false;
@@ -503,7 +549,7 @@ pub const rcp = struct {
             _ = value;
             _ = mask;
             if (offset == @enumToInt(RegRangeOffset.vi_current_reg)) {
-                rcp.mi.getMiInterruptFlags().vi = false;
+                rcp.mi.getMiInterruptFlags().flags.vi = false;
                 return false;
             }
             return true;
@@ -565,7 +611,7 @@ pub const rcp = struct {
                 }
 
                 if (effective_value & 0b10 != 0) { // Clear MI Interrupt bit
-                    rcp.mi.getMiInterruptFlags().pi = false;
+                    rcp.mi.getMiInterruptFlags().flags.pi = false;
                 }
                 return false;
             } else if (offset == @enumToInt(RegRangeOffset.pi_wr_len_reg)) {

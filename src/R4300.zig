@@ -118,7 +118,7 @@ const cp0_write_mask = [32]u32 {
     0x00000000, // count
     0xFFFFE0FF, // entryhi
     0xFFFFFFFF, // compare (also has special handling in mtc0)
-    0xFFFFFF1F, // status
+    0xFFFFFF1F, // status (also has special handling in mtc0)
     0x00000300, // cause (also has special handling in mtc0)
     0xFFFFFFFF, // epc
     0x00000000, // previd
@@ -390,10 +390,7 @@ pub const Instruction = packed struct(u32) {
 
 // On the N64 the PC is really only 32-bit, even though the processor is technically capable of a 64-bit mode.
 pub var pc: u32 = 0;
-
-// Stores the PC before being changed / incremented by the ran instruction. 
-// Used for setting the EPC registers.
-var last_pc: u32 = 0;
+var next_pc: u32 = 0;
 
 var branch_target: ?i32 = null;
 var jump_target: ?u32 = null;
@@ -406,13 +403,6 @@ pub const CpuError = error {
     InvalidInstruction
 };
 
-inline fn overrideBranch() void {
-    branch_target = null;
-    jump_target = null;
-    jump_reg_target = null;
-    is_delay_slot = false;
-}
-
 pub inline fn virtualToPhysical(vAddr: u32) u32 {
     // TODO: Implement the TLB.
     return vAddr & 0x1FFFFFFF;
@@ -423,6 +413,7 @@ fn runHlePif() void {
     // Enable Coprocessor 1.
     getStatusFlags().coprocessor_enable.cop1_enable = true;
     getStatusFlags().floating_point_registers_enable = true; // Enable all floating-point registers.
+    getStatusFlags().diagnostic_field.soft_reset_or_nmi = true; // All the PeterLemon tests say this is enabled, but why???
 
     getConfigFlags().kseg0_flags = 0b011; // Sets kseg0 to be uncached.
     getConfigFlags().cu = false; // An unused bit that can be written to and read from.
@@ -430,6 +421,7 @@ fn runHlePif() void {
     cp0[@enumToInt(Cop0Register.errorepc)] = 0xFFFFFFFF;
     cp0[@enumToInt(Cop0Register.previd)] = 0xB22;
     cp0[@enumToInt(Cop0Register.epc)] = 0xFFFFFFFF;
+    cp0[@enumToInt(Cop0Register.bad_vaddr)] = 0xFFFFFFFF;
 
     // halt the RSP, clear interrupt
     memory.rcp.rsp.reg_range_0.writeAligned(
@@ -506,7 +498,7 @@ fn runHlePif() void {
     gpr[29] = 0xFFFFFFFFA0000000 + @as(u64, cpu_bus.sp_imem_base_addr) + 0xff0;
     gpr[31] = 0xFFFFFFFFA0000000 + @as(u64, cpu_bus.sp_imem_base_addr) + 0x550;
 
-    pc = 0xA0000000 + cpu_bus.sp_dmem_base_addr + 0x40;
+    next_pc = 0xA0000000 + cpu_bus.sp_dmem_base_addr + 0x40;
 }
 
 pub fn init() void {
@@ -514,6 +506,66 @@ pub fn init() void {
 }
 
 pub fn step() CpuError!void {
+    // Handle jumps and branches.
+    if (jump_target != null and is_delay_slot) {
+        next_pc = (pc & 0xF0000000) | jump_target.?;
+    } else if (jump_reg_target != null and is_delay_slot) {
+        next_pc = jump_reg_target.?;
+    } else if (branch_target != null and is_delay_slot) {
+        next_pc = pc +% @bitCast(u32, branch_target.?); // Relative to delay slot instruction.
+    }
+
+    // Handle exceptions (including interrupt exceptions).
+    if (cop0.current_exception != null) {
+        if (!getStatusFlags().is_error) {
+            const vector_offset: u32 = switch (
+                cop0.current_exception.? == .tlb_miss_instruction_fetch or 
+                cop0.current_exception.? == .tlb_miss_load or 
+                cop0.current_exception.? == .tlb_miss_store or 
+                cop0.current_exception.? == .tlb_invalid_instruction_fetch or
+                cop0.current_exception.? == .tlb_modification) {
+                true => 0x000,
+                false => 0x180
+            };
+            if (!getStatusFlags().is_exception) {
+                getCauseFlags().branch_delay_slot = is_delay_slot;
+                cp0[@enumToInt(Cop0Register.epc)] = switch(is_delay_slot) {
+                    true => pc - 4,
+                    false => pc
+                };
+            }
+            getStatusFlags().is_exception = true;
+            next_pc = switch (getStatusFlags().diagnostic_field.bootstrap_exception_vector) {
+                true => 0xBFC00200 + vector_offset,
+                false => 0x80000000 + vector_offset
+            };
+        } else {
+            cp0[@enumToInt(Cop0Register.errorepc)] = pc;
+            next_pc = 0xBFC00000;
+            if (system.config.hle_pif) {
+                runHlePif();
+            }
+        }
+        branch_target = null;
+        jump_target = null;
+        jump_reg_target = null;
+        is_delay_slot = false;
+        cop0.current_exception = null;
+    }
+
+    if ((jump_target != null or branch_target != null or jump_reg_target != null) and is_delay_slot) {
+        is_delay_slot = false;
+        branch_target = null;
+        jump_reg_target = null;
+        jump_target = null;
+    }
+    pc = next_pc;
+
+    // Handle delay slots.
+    if ((jump_target != null or branch_target != null or jump_reg_target != null) and !is_delay_slot) {
+        is_delay_slot = true;
+    }
+
     gpr[0] = 0;
 
     // TODO: Emulate this better?
@@ -534,17 +586,8 @@ pub fn step() CpuError!void {
 
     // Cause an RCP interrupt if we have a pending non-masked MI interrupt.
     getCauseFlags().interrupts_pending.flags.rcp = 
-        (memory.rcp.mi.reg_range.getWordPtr(
-            @enumToInt(memory.rcp.mi.RegRangeOffset.mi_intr_reg)).* & 0b111111) & 
-        (memory.rcp.mi.reg_range.getWordPtr(
-            @enumToInt(memory.rcp.mi.RegRangeOffset.mi_intr_mask_reg)).* & 0b111111) > 0;
-
-    var instruction_ptr = cpu_bus.getWordPtr(virtualToPhysical(pc));
-    std.debug.assert(instruction_ptr != null);
-    last_pc = pc;
-    try interpreter.executeInstruction(@ptrCast(*align(1) Instruction, instruction_ptr.?).*);
-    inst_count +%= 1; // Shouldn't roll over in about 6,000 years
-    // (in contrast to a 32-bit number which will roll over in 40 seconds, both numbers assuming 93.75MHz)
+        (memory.rcp.mi.getMiInterruptFlags().bits & 0b111111) & 
+        (memory.rcp.mi.getMiMaskFlags().bits & 0b111111) > 0;
 
     // Handle interrupts.
     if (getStatusFlags().interrupt_enable and !(getStatusFlags().is_exception or getStatusFlags().is_error)) {
@@ -553,28 +596,11 @@ pub fn step() CpuError!void {
         }
     }
 
-    // Handle exceptions (including interrupt exceptions).
-    if (cop0.current_exception != null) {
-        cop0.jumpToExceptionHandler();
-        cop0.current_exception = null;
-    }
-
-    // Handle jumps and branches.
-    if ((jump_target != null or branch_target != null or jump_reg_target != null) and !is_delay_slot) {
-        is_delay_slot = true;
-    } else if (jump_target != null and is_delay_slot) {
-        pc = (pc & 0xF0000000) | jump_target.?;
-        jump_target = null;
-        is_delay_slot = false;
-    } else if (jump_reg_target != null and is_delay_slot) {
-        pc = jump_reg_target.?;
-        jump_reg_target = null;
-        is_delay_slot = false;
-    } else if (branch_target != null and is_delay_slot) {
-        pc = (pc - 4) +% @bitCast(u32, branch_target.?); // Relative to delay slot instruction.
-        branch_target = null;
-        is_delay_slot = false;
-    }
+    var instruction_ptr = cpu_bus.getWordPtr(virtualToPhysical(pc));
+    std.debug.assert(instruction_ptr != null);
+    try interpreter.executeInstruction(@ptrCast(*align(1) Instruction, instruction_ptr.?).*);
+    inst_count +%= 1; // Shouldn't roll over in about 6,000 years
+    // (in contrast to a 32-bit number which will roll over in 40 seconds, both numbers assuming 93.75MHz)
 }
 
 pub const cop0 = struct {
@@ -682,35 +708,6 @@ pub const cop0 = struct {
         };
 
         current_exception = t;
-    }
-
-    // This function assumes that you've already set all the 
-    // relevant registers describing the kind of exception and exception info.
-    inline fn jumpToExceptionHandler() void {
-        if (!getStatusFlags().is_error) {
-            var vector_offset: u32 = 0x000;
-            if (!getStatusFlags().is_exception) {
-                getCauseFlags().branch_delay_slot = is_delay_slot;
-                cp0[@enumToInt(Cop0Register.epc)] = switch(is_delay_slot) {
-                    true => last_pc - 4,
-                    false => last_pc
-                };
-            } else {
-                vector_offset = 0x180;
-            }
-            getStatusFlags().is_exception = true;
-            pc = switch (getStatusFlags().diagnostic_field.bootstrap_exception_vector) {
-                true => 0xBFC00200 + vector_offset,
-                false => 0x80000000 + vector_offset
-            };
-        } else {
-            cp0[@enumToInt(Cop0Register.errorepc)] = last_pc;
-            pc = 0xBFC00000;
-            if (system.config.hle_pif) {
-                runHlePif();
-            }
-        }
-        overrideBranch();
     }
 };
 
@@ -847,7 +844,7 @@ const interpreter = struct {
     }
 
     fn instNop(_: Instruction) CpuError!void {
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instStubSpecial(inst: Instruction) CpuError!void {
@@ -863,11 +860,10 @@ const interpreter = struct {
         var result = @addWithOverflow(rs, rt);
         if (result.@"1" == 1) {
             cop0.raiseCommonException(.overflow);
-            pc += 4;
             return;
         }
         gpr[r_type.rd] = @bitCast(u64, @as(i64, result.@"0"));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instAddi(inst: Instruction) CpuError!void {
@@ -877,11 +873,10 @@ const interpreter = struct {
         var result = @addWithOverflow(rs, immediate);
         if (result.@"1" == 1) {
             cop0.raiseCommonException(.overflow);
-            pc += 4;
             return;
         }
         gpr[i_type.rt] = @bitCast(u64, @as(i64, result.@"0"));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instAddiu(inst: Instruction) CpuError!void {
@@ -889,7 +884,7 @@ const interpreter = struct {
         var rs = @truncate(i32, @bitCast(i64, gpr[i_type.rs]));
         var immediate = @as(i32, @bitCast(i16, i_type.immediate));
         gpr[i_type.rt] = @bitCast(u64, @as(i64, rs +% immediate));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instAddu(inst: Instruction) CpuError!void {
@@ -897,19 +892,19 @@ const interpreter = struct {
         var rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
         var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
         gpr[r_type.rd] = @bitCast(u64, @as(i64, rs +% rt));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instAnd(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rs] & gpr[r_type.rt];
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instAndi(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type;
         gpr[i_type.rt] = gpr[i_type.rs] & i_type.immediate;
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instCop1(inst: Instruction) CpuError!void {
@@ -957,16 +952,16 @@ const interpreter = struct {
         if (!cp1_coc) {
             branch(i_type_branch.offset);
         }
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     inline fn instBc1fl(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_cop_branch;
         if (!cp1_coc) {
             branch(i_type_branch.offset);
-            pc += 4;
+            next_pc = pc + 4;
         } else {
-            pc += 8;
+            next_pc = pc + 8;
         }
     }
 
@@ -975,16 +970,16 @@ const interpreter = struct {
         if (cp1_coc) {
             branch(i_type_branch.offset);
         }
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     inline fn instBc1tl(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_cop_branch;
         if (cp1_coc) {
             branch(i_type_branch.offset);
-            pc += 4;
+            next_pc = pc + 4;
         } else {
-            pc += 8;
+            next_pc = pc + 8;
         }
     }
 
@@ -993,16 +988,16 @@ const interpreter = struct {
         if (gpr[i_type_branch.rs] == gpr[i_type_branch.rt]) {
             branch(i_type_branch.offset);
         }
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instBeql(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_branch;
         if (gpr[i_type_branch.rs] == gpr[i_type_branch.rt]) {
             branch(i_type_branch.offset);
-            pc += 4;
+            next_pc = pc + 4;
         } else {
-            pc += 8;
+            next_pc = pc + 8;
         }
     }
 
@@ -1044,7 +1039,7 @@ const interpreter = struct {
         if (rs >= 0) {
             branch(i_type_branch.offset);
         }
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     inline fn instBgezal(inst: Instruction) CpuError!void {
@@ -1054,7 +1049,7 @@ const interpreter = struct {
         if (rs >= 0) {
             branch(i_type_branch.offset);
         }
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     inline fn instBgezall(inst: Instruction) CpuError!void {
@@ -1063,9 +1058,9 @@ const interpreter = struct {
         link();
         if (rs >= 0) {
             branch(i_type_branch.offset);
-            pc += 4;
+            next_pc = pc + 4;
         } else {
-            pc += 8;
+            next_pc = pc + 8;
         }
     }
 
@@ -1074,9 +1069,9 @@ const interpreter = struct {
         var rs = @bitCast(i64, gpr[i_type_branch.rs]);
         if (rs >= 0) {
             branch(i_type_branch.offset);
-            pc += 4;
+            next_pc = pc + 4;
         } else {
-            pc += 8;
+            next_pc = pc + 8;
         }
     }
 
@@ -1086,7 +1081,7 @@ const interpreter = struct {
         if (rs > 0) {
             branch(i_type_branch.offset);
         }
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instBgtzl(inst: Instruction) CpuError!void {
@@ -1094,9 +1089,9 @@ const interpreter = struct {
         var rs = @bitCast(i64, gpr[i_type_branch.rs]);
         if (rs > 0) {
             branch(i_type_branch.offset);
-            pc += 4;
+            next_pc = pc + 4;
         } else {
-            pc += 8;
+            next_pc = pc + 8;
         }
     }
 
@@ -1106,7 +1101,7 @@ const interpreter = struct {
         if (rs <= 0) {
             branch(i_type_branch.offset);
         }
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instBlezl(inst: Instruction) CpuError!void {
@@ -1114,9 +1109,9 @@ const interpreter = struct {
         var rs = @bitCast(i64, gpr[i_type_branch.rs]);
         if (rs <= 0) {
             branch(i_type_branch.offset);
-            pc += 4;
+            next_pc = pc + 4;
         } else {
-            pc += 8;
+            next_pc = pc + 8;
         }
     }
 
@@ -1126,7 +1121,7 @@ const interpreter = struct {
         if (rs < 0) {
             branch(i_type_branch.offset);
         }
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     inline fn instBltzal(inst: Instruction) CpuError!void {
@@ -1136,7 +1131,7 @@ const interpreter = struct {
         if (rs < 0) {
             branch(i_type_branch.offset);
         }
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     inline fn instBltzall(inst: Instruction) CpuError!void {
@@ -1145,9 +1140,9 @@ const interpreter = struct {
         link();
         if (rs < 0) {
             branch(i_type_branch.offset);
-            pc += 4;
+            next_pc = pc + 4;
         } else {
-            pc += 8;
+            next_pc = pc + 8;
         }
     }
 
@@ -1156,9 +1151,9 @@ const interpreter = struct {
         var rs = @bitCast(i64, gpr[i_type_branch.rs]);
         if (rs < 0) {
             branch(i_type_branch.offset);
-            pc += 4;
+            next_pc = pc + 4;
         } else {
-            pc += 8;
+            next_pc = pc + 8;
         }
     }
 
@@ -1167,16 +1162,16 @@ const interpreter = struct {
         if (gpr[i_type_branch.rs] != gpr[i_type_branch.rt]) {
             branch(i_type_branch.offset);
         }
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instBnel(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_branch;
         if (gpr[i_type_branch.rs] != gpr[i_type_branch.rt]) {
             branch(i_type_branch.offset);
-            pc += 4;
+            next_pc = pc + 4;
         } else {
-            pc += 8;
+            next_pc = pc + 8;
         }
     }
 
@@ -1186,7 +1181,7 @@ const interpreter = struct {
     }
 
     fn instCache(_: Instruction) CpuError!void {
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     inline fn instCfc1(inst: Instruction) CpuError!void {
@@ -1199,7 +1194,7 @@ const interpreter = struct {
             log.err("The CFC1 instruction only works with the FCRs 0 and 31", .{ });
             return error.InvalidInstruction;
         }
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     inline fn instCtc1(inst: Instruction) CpuError!void {
@@ -1213,7 +1208,7 @@ const interpreter = struct {
             return error.InvalidInstruction;
         }
         cp1_coc = getFcr31Flags().condition;
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDadd(inst: Instruction) CpuError!void {
@@ -1221,11 +1216,10 @@ const interpreter = struct {
         var result = @addWithOverflow(@bitCast(i64, gpr[r_type.rs]), @bitCast(i64, gpr[r_type.rt]));
         if (result.@"1" == 1) {
             cop0.raiseCommonException(.overflow);
-            pc += 4;
             return;
         }
         gpr[r_type.rd] = @bitCast(u64, result.@"0");
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDaddi(inst: Instruction) CpuError!void {
@@ -1234,24 +1228,23 @@ const interpreter = struct {
         var result = @addWithOverflow(@bitCast(i64, gpr[i_type.rs]), immediate);
         if (result.@"1" == 1) {
             cop0.raiseCommonException(.overflow);
-            pc += 4;
             return;
         }
         gpr[i_type.rt] = @bitCast(u64, result.@"0");
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDaddiu(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type;
         var immediate = @as(i64, @bitCast(i16, i_type.immediate));
         gpr[i_type.rt] = @bitCast(u64, @bitCast(i64, gpr[i_type.rs]) +% immediate);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDaddu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @bitCast(i64, gpr[r_type.rs]) +% @bitCast(i64, gpr[r_type.rt]));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDdiv(inst: Instruction) CpuError!void {
@@ -1261,12 +1254,12 @@ const interpreter = struct {
         if (denominator == 0) {
             hi = @bitCast(u64, numerator);
             lo = @bitCast(u64, -std.math.sign(numerator));
-            pc += 4;
+            next_pc = pc + 4;
             return;
         }
         lo = @bitCast(u64, @divTrunc(numerator, denominator));
         hi = @bitCast(u64, @mod(numerator, denominator));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDdivu(inst: Instruction) CpuError!void {
@@ -1276,12 +1269,12 @@ const interpreter = struct {
         if (denominator == 0) {
             hi = numerator;
             lo = @bitCast(u64, @as(i64, -1));
-            pc += 4;
+            next_pc = pc + 4;
             return;
         }
         lo = @divTrunc(numerator, denominator);
         hi = @mod(numerator, denominator);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDiv(inst: Instruction) CpuError!void {
@@ -1291,12 +1284,12 @@ const interpreter = struct {
         if (denominator == 0) {
             hi = @bitCast(u64, @as(i64, numerator));
             lo = @bitCast(u64, @as(i64, -std.math.sign(numerator)));
-            pc += 4;
+            next_pc = pc + 4;
             return;
         }
         lo = @bitCast(u64, @as(i64, @divTrunc(numerator, denominator)));
         hi = @bitCast(u64, @as(i64, @mod(numerator, denominator)));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDivu(inst: Instruction) CpuError!void {
@@ -1306,12 +1299,12 @@ const interpreter = struct {
         if (denominator == 0) {
             hi = @as(u64, numerator);
             lo = @bitCast(u64, @as(i64, -1));
-            pc += 4;
+            next_pc = pc + 4;
             return;
         }
         lo = @as(u64, @divTrunc(numerator, denominator));
         hi = @as(u64, @mod(numerator, denominator));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDmult(inst: Instruction) CpuError!void {
@@ -1321,7 +1314,7 @@ const interpreter = struct {
             @as(i128, @bitCast(i64, gpr[r_type.rt])));
         lo = @truncate(u64, result);
         hi = @truncate(u64, result >> 64);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDmultu(inst: Instruction) CpuError!void {
@@ -1329,61 +1322,61 @@ const interpreter = struct {
         var result = @as(u128, gpr[r_type.rs]) *% @as(u128, gpr[r_type.rt]);
         lo = @truncate(u64, result);
         hi = @truncate(u64, result >> 64);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDsll(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rt] << r_type.sa;
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDsllv(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rt] << @truncate(u5, gpr[r_type.rs]);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDsll32(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rt] << (@as(u6, r_type.sa) + 32);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDsra(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @bitCast(i64, gpr[r_type.rt]) >> r_type.sa);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDsrav(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @bitCast(i64, gpr[r_type.rt]) >> @truncate(u5, gpr[r_type.rs]));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDsra32(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @bitCast(i64, gpr[r_type.rt]) >> (@as(u6, r_type.sa) + 32));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDsrl(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rt] >> r_type.sa;
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDsrlv(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rt] >> @truncate(u5, gpr[r_type.rs]);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDsrl32(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rt] >> (@as(u6, r_type.sa) + 32);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDsub(inst: Instruction) CpuError!void {
@@ -1391,17 +1384,16 @@ const interpreter = struct {
         var result = @subWithOverflow(@bitCast(i64, gpr[r_type.rs]), @bitCast(i64, gpr[r_type.rt]));
         if (result.@"1" == 1) {
             cop0.raiseCommonException(.overflow);
-            pc += 4;
             return;
         }
         gpr[r_type.rd] = @bitCast(u64, result.@"0");
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instDsubu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @bitCast(i64, gpr[r_type.rs]) -% @bitCast(i64, gpr[r_type.rt]));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instCop0(inst: Instruction) CpuError!void {
@@ -1425,10 +1417,10 @@ const interpreter = struct {
     inline fn instEret(_: Instruction) CpuError!void {
         const status = getStatusFlags();
         if (status.is_error) {
-            pc = cp0[@enumToInt(Cop0Register.errorepc)];
+            next_pc = cp0[@enumToInt(Cop0Register.errorepc)];
             status.is_error = false;
         } else {
-            pc = cp0[@enumToInt(Cop0Register.epc)];
+            next_pc = cp0[@enumToInt(Cop0Register.epc)];
             status.is_exception = false;
         }
         ll_bit = false;
@@ -1437,27 +1429,27 @@ const interpreter = struct {
     fn instJ(inst: Instruction) CpuError!void {
         const j_type = inst.data.j_type;
         jump(j_type.target);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instJal(inst: Instruction) CpuError!void {
         const j_type = inst.data.j_type;
         link();
         jump(j_type.target);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instJalr(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         linkReg(r_type.rd);
         jumpReg(r_type.rs);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instJr(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         jumpReg(r_type.rs);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instLb(inst: Instruction) CpuError!void {
@@ -1465,7 +1457,7 @@ const interpreter = struct {
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         var result = cpu_bus.readAligned(u8, physical_address);
         gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i8, result)));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instLbu(inst: Instruction) CpuError!void {
@@ -1473,7 +1465,7 @@ const interpreter = struct {
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         var result = cpu_bus.readAligned(u8, physical_address);
         gpr[i_type.rt] = result;
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instLd(inst: Instruction) CpuError!void {
@@ -1482,12 +1474,11 @@ const interpreter = struct {
         if (address & 0b111 != 0) {
             cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
             cop0.raiseCommonException(.address_error_load);
-            pc += 4;
             return;
         }
         const physical_address = virtualToPhysical(address);
         gpr[i_type.rt] = cpu_bus.readAligned(u64, physical_address);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instLdc1(inst: Instruction) CpuError!void {
@@ -1496,13 +1487,12 @@ const interpreter = struct {
         if (address & 0b111 != 0) {
             cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
             cop0.raiseCommonException(.address_error_load);
-            pc += 4;
             return;
         }
         const physical_address = virtualToPhysical(address);
         // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
         fpr[i_type.rt] = cpu_bus.readAligned(u64, physical_address);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     // TODO: Implement LDL and LDR
@@ -1513,12 +1503,11 @@ const interpreter = struct {
         if (address & 0b1 != 0) {
             cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
             cop0.raiseCommonException(.address_error_load);
-            pc += 4;
             return;
         }
         const physical_address = virtualToPhysical(address);
         gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i16, cpu_bus.readAligned(u16, physical_address))));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instLhu(inst: Instruction) CpuError!void {
@@ -1527,18 +1516,17 @@ const interpreter = struct {
         if (address & 0b1 != 0) {
             cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
             cop0.raiseCommonException(.address_error_load);
-            pc += 4;
             return;
         }
         const physical_address = virtualToPhysical(address);
         gpr[i_type.rt] = cpu_bus.readAligned(u16, physical_address);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instLui(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type;
         gpr[i_type.rt] = @bitCast(u64, @as(i64, @as(i32, @bitCast(i16, i_type.immediate)) << 16));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instLw(inst: Instruction) CpuError!void {
@@ -1547,12 +1535,11 @@ const interpreter = struct {
         if (address & 0b11 != 0) {
             cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
             cop0.raiseCommonException(.address_error_load);
-            pc += 4;
             return;
         }
         const physical_address = virtualToPhysical(address);
         gpr[i_type.rt] = @bitCast(u64, @as(i64, @bitCast(i32, cpu_bus.readAligned(u32, physical_address))));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instLwc1(inst: Instruction) CpuError!void {
@@ -1561,13 +1548,12 @@ const interpreter = struct {
         if (address & 0b11 != 0) {
             cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
             cop0.raiseCommonException(.address_error_load);
-            pc += 4;
             return;
         }
         const physical_address = virtualToPhysical(address);
         // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
         fpr[i_type.rt] = cpu_bus.readAligned(u32, physical_address);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     // TODO: Implement LWL and LWR
@@ -1578,36 +1564,35 @@ const interpreter = struct {
         if (address & 0b11 != 0) {
             cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
             cop0.raiseCommonException(.address_error_load);
-            pc += 4;
             return;
         }
         const physical_address = virtualToPhysical(address);
         gpr[i_type.rt] = cpu_bus.readAligned(u32, physical_address);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     inline fn instMfc0(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type_cop;
         gpr[r_type.rt] = cp0[r_type.rd];
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     inline fn instMfc1(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type_cop;
         gpr[r_type.rt] = @bitCast(u64, @as(i64, @bitCast(i32, @truncate(u32, fpr[r_type.rd]))));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instMfhi(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = hi;
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instMflo(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = lo;
-        pc += 4;
+        next_pc = pc + 4;
     }
     
     inline fn instMtc0(inst: Instruction) CpuError!void {
@@ -1621,37 +1606,37 @@ const interpreter = struct {
         } else if (r_type.rd == @enumToInt(Cop0Register.compare)) {
             getCauseFlags().interrupts_pending.flags.timer_interrupt = false;
             cp0[r_type.rd] = @truncate(u32, gpr[r_type.rt]);
-        } else if (r_type.rd == @enumToInt(Cop0Register.cause)) {
+        } else if (r_type.rd == @enumToInt(Cop0Register.cause) or r_type.rd == @enumToInt(Cop0Register.status)) {
             cp0[r_type.rd] &= ~cp0_write_mask[r_type.rd];
             cp0[r_type.rd] |= @truncate(u32, gpr[r_type.rt]) & cp0_write_mask[r_type.rd];
         } else if (r_type.rd == @enumToInt(Cop0Register.taghi)) {
             cp0[r_type.rd] = 0;
         } else {
             if (cp0_write_mask[r_type.rd] == 0) {
-                pc += 4;
+                next_pc = pc + 4;
                 return;
             }
             cp0[r_type.rd] = @truncate(u32, gpr[r_type.rt]) & cp0_write_mask[r_type.rd];
         }
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     inline fn instMtc1(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type_cop;
         fpr[r_type.rd] = @truncate(u32, gpr[r_type.rt]);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instMthi(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         hi = gpr[r_type.rs];
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instMtlo(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         lo = gpr[r_type.rs];
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instMult(inst: Instruction) CpuError!void {
@@ -1661,7 +1646,7 @@ const interpreter = struct {
             @as(i64, @bitCast(i32, @truncate(u32, gpr[r_type.rt])));
         lo = @bitCast(u64, @as(i64, @truncate(i32, result)));
         hi = @bitCast(u64, @as(i64, @truncate(i32, result >> 32)));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instMultu(inst: Instruction) CpuError!void {
@@ -1669,32 +1654,32 @@ const interpreter = struct {
         var result = @as(u64, @truncate(u32, gpr[r_type.rs])) *% @as(u64, @truncate(u32, gpr[r_type.rt]));
         lo = @bitCast(u64, @as(i64, @bitCast(i32, @truncate(u32, result))));
         hi = @bitCast(u64, @as(i64, @bitCast(i32, @truncate(u32, result >> 32))));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instNor(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = ~(gpr[r_type.rs] | gpr[r_type.rt]);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instOr(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rs] | gpr[r_type.rt];
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instOri(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type;
         gpr[i_type.rt] = gpr[i_type.rs] | @as(u64, i_type.immediate);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSb(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type_mem;
         var physical_address = virtualToPhysical(calculateAddress(i_type.base, i_type.offset));
         cpu_bus.writeAligned(physical_address, @truncate(u8, gpr[i_type.rt]));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSd(inst: Instruction) CpuError!void {
@@ -1703,12 +1688,11 @@ const interpreter = struct {
         if (address & 0b111 != 0) {
             cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
             cop0.raiseCommonException(.address_error_store);
-            pc += 4;
             return;
         }
         const physical_address = virtualToPhysical(address);
         cpu_bus.writeAligned(physical_address, gpr[i_type.rt]);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSdc1(inst: Instruction) CpuError!void {
@@ -1717,13 +1701,12 @@ const interpreter = struct {
         if (address & 0b111 != 0) {
             cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
             cop0.raiseCommonException(.address_error_store);
-            pc += 4;
             return;
         }
         const physical_address = virtualToPhysical(address);
         // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
         cpu_bus.writeAligned(physical_address, fpr[i_type.rt]);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     // TODO: Implement SDL and SDR
@@ -1734,78 +1717,77 @@ const interpreter = struct {
         if (address & 0b1 != 0) {
             cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
             cop0.raiseCommonException(.address_error_store);
-            pc += 4;
             return;
         }
         const physical_address = virtualToPhysical(address);
         cpu_bus.writeAligned(physical_address, @truncate(u16, gpr[i_type.rt]));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSll(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @as(i64, 
             @bitCast(i32, @truncate(u32, gpr[r_type.rt]) << r_type.sa)));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSllv(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @as(i64, 
             @bitCast(i32, @truncate(u32, gpr[r_type.rt]) << @truncate(u5, gpr[r_type.rs]))));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSlt(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @boolToInt(@bitCast(i64, gpr[r_type.rs]) < @bitCast(i64, gpr[r_type.rt]));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSlti(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type;
         gpr[i_type.rt] = @boolToInt(@bitCast(i64, gpr[i_type.rs]) < @bitCast(i16, i_type.immediate));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSltiu(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type;
         gpr[i_type.rt] = @boolToInt(gpr[i_type.rs] < @bitCast(i16, i_type.immediate));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSltu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @boolToInt(gpr[r_type.rs] < gpr[r_type.rt]);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSra(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @as(i64, 
             @bitCast(i32, @truncate(u32, gpr[r_type.rt])) >> r_type.sa));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSrav(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @as(i64, 
             @bitCast(i32, @truncate(u32, gpr[r_type.rt])) >> @truncate(u5, gpr[r_type.rs])));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSrl(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @as(i64, @bitCast(i32,
             @truncate(u32, gpr[r_type.rt]) >> r_type.sa)));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSrlv(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = @bitCast(u64, @as(i64, @bitCast(i32, 
             @truncate(u32, gpr[r_type.rt]) >> @truncate(u5, gpr[r_type.rs]))));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSub(inst: Instruction) CpuError!void {
@@ -1815,11 +1797,10 @@ const interpreter = struct {
         var result = @subWithOverflow(rs, rt);
         if (result.@"1" == 1) {
             cop0.raiseCommonException(.overflow);
-            pc += 4;
             return;
         }
         gpr[r_type.rd] = @bitCast(u64, @as(i64, result.@"0"));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSubu(inst: Instruction) CpuError!void {
@@ -1827,7 +1808,7 @@ const interpreter = struct {
         var rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
         var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
         gpr[r_type.rd] = @bitCast(u64, @as(i64, rs -% rt));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSw(inst: Instruction) CpuError!void {
@@ -1836,12 +1817,11 @@ const interpreter = struct {
         if (address & 0b11 != 0) {
             cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
             cop0.raiseCommonException(.address_error_store);
-            pc += 4;
             return;
         }
         const physical_address = virtualToPhysical(address);
         cpu_bus.writeAligned(physical_address, @truncate(u32, gpr[i_type.rt]));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instSwc1(inst: Instruction) CpuError!void {
@@ -1850,13 +1830,12 @@ const interpreter = struct {
         if (address & 0b11 != 0) {
             cp0[@enumToInt(Cop0Register.bad_vaddr)] = address;
             cop0.raiseCommonException(.address_error_store);
-            pc += 4;
             return;
         }
         const physical_address = virtualToPhysical(address);
         // Note: Ignoring the FR bit in the Status Register for speed reasons, as it's not necessary.
         cpu_bus.writeAligned(physical_address, @truncate(u32, fpr[i_type.rt]));
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     // TODO: Implement SWL and SWR
@@ -1866,13 +1845,13 @@ const interpreter = struct {
     fn instXor(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
         gpr[r_type.rd] = gpr[r_type.rs] ^ gpr[r_type.rt];
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instXori(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type;
         gpr[i_type.rt] = gpr[i_type.rs] ^ @as(u64, i_type.immediate);
-        pc += 4;
+        next_pc = pc + 4;
     }
 
     fn instStub(inst: Instruction) CpuError!void {
