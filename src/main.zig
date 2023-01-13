@@ -66,23 +66,33 @@ fn runSystem() !void {
     }
 }
 
+const EmulatorError = error {
+    GlfwFailedToInitialize,
+    GlfwWindowFailedToCreate
+};
+
 fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8, config: system.Config) !void {
     try system.init(bootrom_path, rom_path, config);
 
     var system_thread = try std.Thread.spawn(.{ }, runSystem, .{ });
     try system_thread.setName("Emulator Thread");
 
-    try glfw.init(.{});
+    if (!glfw.init(.{})) {
+        return EmulatorError.GlfwFailedToInitialize;
+    }
     defer glfw.terminate();
 
-    const window = try glfw.Window.create(640, 480, "Zig64", null, null, .{
+    const window = glfw.Window.create(640, 480, "Zig64", null, null, .{
         .opengl_profile = .opengl_core_profile,
         .context_version_major = 3,
         .context_version_minor = 3
     });
-    defer window.destroy();
+    if (window == null) {
+        return EmulatorError.GlfwWindowFailedToCreate;
+    }
+    defer window.?.destroy();
 
-    try glfw.makeContextCurrent(window);
+    glfw.makeContextCurrent(window.?);
 
     const proc: glfw.GLProc = undefined;
     try gl.load(proc, glGetProcAddress);
@@ -95,13 +105,13 @@ fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8, config: system.C
     var io = c.igGetIO();
     io.*.ConfigFlags |= c.ImGuiConfigFlags_NavEnableGamepad;
 
-    _ = c.ImGui_ImplGlfw_InitForOpenGL(@ptrCast(*c.GLFWwindow, window.handle), true);
+    _ = c.ImGui_ImplGlfw_InitForOpenGL(@ptrCast(*c.GLFWwindow, window.?.handle), true);
     _ = c.ImGui_ImplOpenGL3_Init("#version 150");
 
     c.igStyleColorsDark(null);
 
-    while (!window.shouldClose()) {
-        try glfw.pollEvents();
+    while (!window.?.shouldClose()) {
+        glfw.pollEvents();
 
         c.ImGui_ImplOpenGL3_NewFrame();
         c.ImGui_ImplGlfw_NewFrame();
@@ -119,7 +129,7 @@ fn runEmulator(bootrom_path: ?[]const u8, rom_path: []const u8, config: system.C
 
         c.ImGui_ImplOpenGL3_RenderDrawData(c.igGetDrawData());
 
-        try window.swapBuffers();
+        window.?.swapBuffers();
     }
     running = false;
     system_thread.join();
