@@ -307,7 +307,7 @@ const interpreter = struct {
         }
     }
 
-    inline fn instBgez(inst: Instruction) RspError!void {
+    fn instBgez(inst: Instruction) RspError!void {
         const i_type_branch = inst.data.i_type_branch;
         const rs = @bitCast(i32, gpr[i_type_branch.rs]);
         if (rs >= 0) {
@@ -316,7 +316,7 @@ const interpreter = struct {
         getPc().* +%= 4;
     }
 
-    inline fn instBgezal(inst: Instruction) RspError!void {
+    fn instBgezal(inst: Instruction) RspError!void {
         const i_type_branch = inst.data.i_type_branch;
         const rs = @bitCast(i32, gpr[i_type_branch.rs]);
         link();
@@ -344,7 +344,7 @@ const interpreter = struct {
         getPc().* +%= 4;
     }
 
-    inline fn instBltz(inst: Instruction) RspError!void {
+    fn instBltz(inst: Instruction) RspError!void {
         const i_type_branch = inst.data.i_type_branch;
         const rs = @bitCast(i32, gpr[i_type_branch.rs]);
         if (rs < 0) {
@@ -353,7 +353,7 @@ const interpreter = struct {
         getPc().* +%= 4;
     }
 
-    inline fn instBltzal(inst: Instruction) RspError!void {
+    fn instBltzal(inst: Instruction) RspError!void {
         const i_type_branch = inst.data.i_type_branch;
         const rs = @bitCast(i32, gpr[i_type_branch.rs]);
         link();
@@ -484,7 +484,7 @@ const interpreter = struct {
         }
     }
 
-    inline fn getCop0MemRange(rd: u5) RspError!*memory.MemRange {
+    fn getCop0MemRange(rd: u5) RspError!*memory.MemRange {
         return switch(rd) {
             @enumToInt(Cop0Register.sp_mem_addr) => &memory.rcp.rsp.reg_range_0,
             @enumToInt(Cop0Register.sp_dram_addr) => &memory.rcp.rsp.reg_range_0,
@@ -506,7 +506,7 @@ const interpreter = struct {
         };
     }
 
-    inline fn getCop0MemOffset(rd: u5) RspError!u32 {
+    fn getCop0MemOffset(rd: u5) RspError!u32 {
         return switch(rd) {
             @enumToInt(Cop0Register.sp_mem_addr) => @enumToInt(memory.rcp.rsp.RegRange0Offset.sp_mem_addr_reg),
             @enumToInt(Cop0Register.sp_dram_addr) => @enumToInt(memory.rcp.rsp.RegRange0Offset.sp_dram_addr_reg),
@@ -528,7 +528,7 @@ const interpreter = struct {
         };
     }
 
-    inline fn instMfc0(inst: Instruction) RspError!void {
+    fn instMfc0(inst: Instruction) RspError!void {
         const r_type = inst.data.r_type_cop;
         const mem_range: *memory.MemRange = try getCop0MemRange(r_type.rd);
         const mem_offset: u32 = try getCop0MemOffset(r_type.rd);
@@ -536,7 +536,7 @@ const interpreter = struct {
         getPc().* +%= 4;
     }
 
-    inline fn instMtc0(inst: Instruction) RspError!void {
+    fn instMtc0(inst: Instruction) RspError!void {
         const r_type = inst.data.r_type_cop;
         const mem_range: *memory.MemRange = try getCop0MemRange(r_type.rd);
         const mem_offset: u32 = try getCop0MemOffset(r_type.rd);

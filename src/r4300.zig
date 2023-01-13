@@ -405,7 +405,7 @@ pub const CpuError = error {
     InvalidInstruction
 };
 
-pub inline fn virtualToPhysical(vAddr: u32) u32 {
+inline fn virtualToPhysical(vAddr: u32) u32 {
     // TODO: Implement the TLB.
     return vAddr & 0x1FFFFFFF;
 }
@@ -954,7 +954,7 @@ const interpreter = struct {
         }
     }
 
-    inline fn instBc1f(inst: Instruction) CpuError!void {
+    fn instBc1f(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_cop_branch;
         if (!cp1_coc) {
             branch(i_type_branch.offset);
@@ -962,7 +962,7 @@ const interpreter = struct {
         next_pc = pc + 4;
     }
 
-    inline fn instBc1fl(inst: Instruction) CpuError!void {
+    fn instBc1fl(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_cop_branch;
         if (!cp1_coc) {
             branch(i_type_branch.offset);
@@ -972,7 +972,7 @@ const interpreter = struct {
         }
     }
 
-    inline fn instBc1t(inst: Instruction) CpuError!void {
+    fn instBc1t(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_cop_branch;
         if (cp1_coc) {
             branch(i_type_branch.offset);
@@ -980,7 +980,7 @@ const interpreter = struct {
         next_pc = pc + 4;
     }
 
-    inline fn instBc1tl(inst: Instruction) CpuError!void {
+    fn instBc1tl(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_cop_branch;
         if (cp1_coc) {
             branch(i_type_branch.offset);
@@ -1040,7 +1040,7 @@ const interpreter = struct {
         }
     }
 
-    inline fn instBgez(inst: Instruction) CpuError!void {
+    fn instBgez(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_regimm_branch;
         const rs = @bitCast(i64, gpr[i_type_branch.rs]);
         if (rs >= 0) {
@@ -1049,7 +1049,7 @@ const interpreter = struct {
         next_pc = pc + 4;
     }
 
-    inline fn instBgezal(inst: Instruction) CpuError!void {
+    fn instBgezal(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_regimm_branch;
         var rs = @bitCast(i64, gpr[i_type_branch.rs]);
         link();
@@ -1059,7 +1059,7 @@ const interpreter = struct {
         next_pc = pc + 4;
     }
 
-    inline fn instBgezall(inst: Instruction) CpuError!void {
+    fn instBgezall(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_regimm_branch;
         var rs = @bitCast(i64, gpr[i_type_branch.rs]);
         link();
@@ -1071,7 +1071,7 @@ const interpreter = struct {
         }
     }
 
-    inline fn instBgezl(inst: Instruction) CpuError!void {
+    fn instBgezl(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_regimm_branch;
         var rs = @bitCast(i64, gpr[i_type_branch.rs]);
         if (rs >= 0) {
@@ -1122,7 +1122,7 @@ const interpreter = struct {
         }
     }
 
-    inline fn instBltz(inst: Instruction) CpuError!void {
+    fn instBltz(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_regimm_branch;
         var rs = @bitCast(i64, gpr[i_type_branch.rs]);
         if (rs < 0) {
@@ -1131,7 +1131,7 @@ const interpreter = struct {
         next_pc = pc + 4;
     }
 
-    inline fn instBltzal(inst: Instruction) CpuError!void {
+    fn instBltzal(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_regimm_branch;
         var rs = @bitCast(i64, gpr[i_type_branch.rs]);
         link();
@@ -1141,7 +1141,7 @@ const interpreter = struct {
         next_pc = pc + 4;
     }
 
-    inline fn instBltzall(inst: Instruction) CpuError!void {
+    fn instBltzall(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_regimm_branch;
         var rs = @bitCast(i64, gpr[i_type_branch.rs]);
         link();
@@ -1153,7 +1153,7 @@ const interpreter = struct {
         }
     }
 
-    inline fn instBltzl(inst: Instruction) CpuError!void {
+    fn instBltzl(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_regimm_branch;
         var rs = @bitCast(i64, gpr[i_type_branch.rs]);
         if (rs < 0) {
@@ -1191,7 +1191,7 @@ const interpreter = struct {
         next_pc = pc + 4;
     }
 
-    inline fn instCfc1(inst: Instruction) CpuError!void {
+    fn instCfc1(inst: Instruction) CpuError!void {
         const r_type_cop = inst.data.r_type_cop;
         if (r_type_cop.rt == 0) {
             gpr[r_type_cop.rd] = @bitCast(u64, @as(i64, fcr0));
@@ -1204,7 +1204,7 @@ const interpreter = struct {
         next_pc = pc + 4;
     }
 
-    inline fn instCtc1(inst: Instruction) CpuError!void {
+    fn instCtc1(inst: Instruction) CpuError!void {
         const r_type_cop = inst.data.r_type_cop;
         if (r_type_cop.rt == 0) {
             fcr0 = @truncate(u32, gpr[r_type_cop.rt]);
@@ -1421,7 +1421,7 @@ const interpreter = struct {
         }
     }
 
-    inline fn instEret(_: Instruction) CpuError!void {
+    fn instEret(_: Instruction) CpuError!void {
         const status = getStatusFlags();
         if (status.is_error) {
             next_pc = cp0[@enumToInt(Cop0Register.errorepc)];
@@ -1578,13 +1578,13 @@ const interpreter = struct {
         next_pc = pc + 4;
     }
 
-    inline fn instMfc0(inst: Instruction) CpuError!void {
+    fn instMfc0(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type_cop;
         gpr[r_type.rt] = cp0[r_type.rd];
         next_pc = pc + 4;
     }
 
-    inline fn instMfc1(inst: Instruction) CpuError!void {
+    fn instMfc1(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type_cop;
         gpr[r_type.rt] = @bitCast(u64, @as(i64, @bitCast(i32, @truncate(u32, fpr[r_type.rd]))));
         next_pc = pc + 4;
@@ -1602,7 +1602,7 @@ const interpreter = struct {
         next_pc = pc + 4;
     }
     
-    inline fn instMtc0(inst: Instruction) CpuError!void {
+    fn instMtc0(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type_cop;
         if (r_type.rd == @enumToInt(Cop0Register.context)) {
             cp0[r_type.rd] = (@truncate(u32, gpr[r_type.rt]) & cp0_write_mask[r_type.rd]) 
@@ -1628,7 +1628,7 @@ const interpreter = struct {
         next_pc = pc + 4;
     }
 
-    inline fn instMtc1(inst: Instruction) CpuError!void {
+    fn instMtc1(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type_cop;
         fpr[r_type.rd] = @truncate(u32, gpr[r_type.rt]);
         next_pc = pc + 4;
