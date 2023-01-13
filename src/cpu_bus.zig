@@ -77,7 +77,7 @@ inline fn getMemoryEntry(physical_address: u32) ?*const MemoryEntry {
     return null;
 }
 
-pub fn getWordPtr(physical_address: u32) ?*align(1) u32 {
+pub fn getWordPtr(physical_address: u32) ?*u32 {
     const entry = getMemoryEntry(physical_address);
     if (entry == null) return null;
 

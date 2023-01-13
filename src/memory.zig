@@ -45,18 +45,18 @@ pub const MemRange = struct {
     }
 
     inline fn writeWord(self: *Self, offset: u32, value: u32) void {
-        var dst_ptr = @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
+        var dst_ptr = @alignCast(4, @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr));
         dst_ptr.* = value;
     }
 
     inline fn readWord(self: *Self, offset: u32) u32 {
-        var dst_ptr = @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
+        var dst_ptr = @alignCast(4, @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr));
         return dst_ptr.*;
     }
 
-    pub fn getWordPtr(self: *Self, offset: u32) *align(1) u32 {
+    pub fn getWordPtr(self: *Self, offset: u32) *u32 {
         std.debug.assert(offset & 0b11 == 0);
-        return @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
+        return @alignCast(4, @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr));
     }
 
     // The way this works is all reads and writes are only done to the 32-bit boundary, 
@@ -64,7 +64,7 @@ pub const MemRange = struct {
     // By calculating the mask we need based on the 32-bit boundary, we can simplify IO register events, 
     // and store everything in the CPUs native endian. (This is based off of mupen64plus's memory handling)
     inline fn writeWordMasked(self: *Self, offset: u32, value: u32, mask: u32) void {
-        var dst_ptr = @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr);
+        var dst_ptr = @alignCast(4, @ptrCast(*align(1) u32, self.buf[offset..offset+3].ptr));
         dst_ptr.* = (dst_ptr.* & ~mask) | (value & mask);
     }
 
@@ -191,7 +191,7 @@ pub const rdram = struct {
         rdram_device_manuf_reg = 0x24
     };
 
-    pub fn getReg(offset: RegRangeOffset, module: u8) *align(1) u32 {
+    pub fn getReg(offset: RegRangeOffset, module: u8) *u32 {
         return reg_range.getWordPtr(@enumToInt(offset) + (module * rdram_module_reg_count * @sizeOf(u32)));
     }
 
@@ -234,121 +234,207 @@ pub const rcp = struct {
             sp_semaphore_reg = 0x1c
         };
 
+        pub const SpStatusBits = packed struct(u32) {
+            halt: bool,
+            broke: bool,
+            dma_busy: bool,
+            dma_full: bool,
+            io_full: bool,
+            single_step: bool,
+            interrupt_on_break: bool,
+            signal_0: bool,
+            signal_1: bool,
+            signal_2: bool,
+            signal_3: bool,
+            signal_4: bool,
+            signal_5: bool,
+            signal_6: bool,
+            signal_7: bool,
+            _always_zero: u17
+        };
+        pub fn getSpStatusFlags() *SpStatusBits {
+            return @ptrCast(*SpStatusBits, 
+                reg_range_0.getWordPtr(@enumToInt(RegRange0Offset.sp_status_reg)));
+        }
+
         pub var reg_range_1: MemRange = undefined;
         pub const RegRange1Offset = enum(u8) {
             sp_pc_reg = 0x00,
             sp_ibist_reg = 0x04
         };
 
+        const DmaDirection = enum {
+            to_dram,
+            to_rsp
+        };
+        fn rspDma(length_register: u32, comptime direction: DmaDirection) void {
+            const rsp_mem_addr = reg_range_0.getWordPtr(
+                @enumToInt(RegRange0Offset.sp_mem_addr_reg));
+            const dram_mem_addr = reg_range_0.getWordPtr(
+                @enumToInt(RegRange0Offset.sp_dram_addr_reg));
+            const rsp_mem = switch (rsp_mem_addr.* & 0x1000 > 0) {
+                true => &imem,
+                false => &dmem
+            };
+
+            // (ignores top 3 bits and assumes all ones since it's 64-bit aligned)
+            var length  = ((length_register & 0x00000FFF) | 0b111) + 1;
+            const count =  (length_register & 0x000FF000) >> 12;
+            const skip  =  (length_register & 0xFFF00000) >> 20;
+
+            // Cap the length.
+            if ((rsp_mem_addr.* & 0xFFF) + length > 0x1000) {
+                length = 0x1000 - (rsp_mem_addr.* & 0xFFF);
+            }
+
+            // Aligned to 4-byte (32-bit) boundary.
+            var src_offset: *u32 = undefined;
+            var dst_offset: *u32 = undefined;
+            comptime var src_mask: u32 = undefined;
+            comptime var dst_mask: u32 = undefined;
+            var src: *MemRange = undefined;
+            var dst: *MemRange = undefined;
+            if (direction == .to_rsp) {
+                src = &rdram.dram;
+                dst = rsp_mem;
+                src_offset = dram_mem_addr;
+                dst_offset = rsp_mem_addr;
+                src_mask = 0x7FFFFC;
+                dst_mask = 0xFFC;
+            } else if (direction == .to_dram) {
+                src = rsp_mem;
+                dst = &rdram.dram;
+                src_offset = rsp_mem_addr;
+                dst_offset = dram_mem_addr;
+                src_mask = 0xFFC;
+                dst_mask = 0x7FFFFC;
+            } else {
+                unreachable;
+            }
+
+            src_offset.* &= ~@as(u32, 0b111);
+            dst_offset.* &= ~@as(u32, 0b111);
+            var line: u32 = 0;
+            while (line <= count) : (line += 1) {
+                var x: u32 = 0;
+                while (x < length) : (x += 4) {
+                    dst.getWordPtr((dst_offset.* + x) & dst_mask).* = src.getWordPtr((src_offset.* + x) & src_mask).*;
+                }
+                rsp_mem_addr.* += length;
+                dram_mem_addr.* += length + skip;
+            }
+        }
+
         fn regRange0WriteEvent(offset: u32, value: u32, mask: u32) bool {
             const effective_value = value & mask;
-            if (offset == @enumToInt(RegRange0Offset.sp_mem_addr_reg) or
-                offset == @enumToInt(RegRange0Offset.sp_dram_addr_reg) or
-                offset == @enumToInt(RegRange0Offset.sp_rd_len_reg) or
-                offset == @enumToInt(RegRange0Offset.sp_wr_len_reg)) {
+
+            if (offset == @enumToInt(RegRange0Offset.sp_rd_len_reg)) {
+                rspDma(effective_value, .to_rsp);
+            } else if (offset == @enumToInt(RegRange0Offset.sp_wr_len_reg)) {
+                rspDma(effective_value, .to_dram);
+            } else if (offset == @enumToInt(RegRange0Offset.sp_mem_addr_reg) or
+                       offset == @enumToInt(RegRange0Offset.sp_dram_addr_reg)) {
                 return true;
             } else if (offset == @enumToInt(RegRange0Offset.sp_status_reg)) {
-                var status_reg = reg_range_0.getWordPtr(offset);
-
                 // Halt Bit
                 if (effective_value & 0b01 != 0) { // Clear
-                    status_reg.* &= ~@as(u32, 0b01);
+                    getSpStatusFlags().halt = false;
                 }
                 if (effective_value & 0b10 != 0) { // Set
-                    status_reg.* |= 0b01;
+                    getSpStatusFlags().halt = true;
                 }
 
                 // Broke bit
                 if (effective_value & 0b100 != 0) { // Clear
-                    status_reg.* &= ~@as(u32, 0b10);
+                    getSpStatusFlags().broke = false;
                 }
 
                 // MI interrupt bit
                 if (effective_value & 0b01000 != 0) { // Clear
-                    rcp.mi.getMiInterruptFlags().flags.sp = false;
+                    rcp.mi.getMiInterruptFlags().sp = false;
                 }
                 if (effective_value & 0b10000 != 0) { // Set
-                    rcp.mi.getMiInterruptFlags().flags.sp = true;
+                    rcp.mi.getMiInterruptFlags().sp = true;
                 }
 
                 // Single-step bit
                 if (effective_value & 0b0100000 != 0) { // Clear
-                    status_reg.* &= ~@as(u32, 0b100000);
+                    getSpStatusFlags().single_step = false;
                 }
                 if (effective_value & 0b1000000 != 0) { // Set
-                    status_reg.* |= 0b100000;
+                    getSpStatusFlags().single_step = true;
                 }
 
                 // Interrupt on break bit
                 if (effective_value & 0b010000000 != 0) { // Clear
-                    status_reg.* &= ~@as(u32, 0b1000000);
+                    getSpStatusFlags().interrupt_on_break = false;
                 }
                 if (effective_value & 0b100000000 != 0) { // Set
-                    status_reg.* |= 0b1000000;
+                    getSpStatusFlags().interrupt_on_break = true;
                 }
 
                 // Signal 0 bit
                 if (effective_value & 0b01000000000 != 0) { // Clear
-                    status_reg.* &= ~@as(u32, 0b10000000);
+                    getSpStatusFlags().signal_0 = false;
                 }
                 if (effective_value & 0b10000000000 != 0) { // Set
-                    status_reg.* |= 0b10000000;
+                    getSpStatusFlags().signal_0 = true;
                 }
 
                 // Signal 1 bit
                 if (effective_value & 0b0100000000000 != 0) { // Clear
-                    status_reg.* &= ~@as(u32, 0b100000000);
+                    getSpStatusFlags().signal_1 = false;
                 }
                 if (effective_value & 0b1000000000000 != 0) { // Set
-                    status_reg.* |= 0b100000000;
+                    getSpStatusFlags().signal_1 = true;
                 }
 
                 // Signal 2 bit
                 if (effective_value & 0b010000000000000 != 0) { // Clear
-                    status_reg.* &= ~@as(u32, 0b1000000000);
+                    getSpStatusFlags().signal_2 = false;
                 }
                 if (effective_value & 0b100000000000000 != 0) { // Set
-                    status_reg.* |= 0b1000000000;
+                    getSpStatusFlags().signal_2 = true;
                 }
 
                 // Signal 3 bit
                 if (effective_value & 0b01000000000000000 != 0) { // Clear
-                    status_reg.* &= ~@as(u32, 0b10000000000);
+                    getSpStatusFlags().signal_3 = false;
                 }
                 if (effective_value & 0b10000000000000000 != 0) { // Set
-                    status_reg.* |= 0b10000000000;
+                    getSpStatusFlags().signal_3 = true;
                 }
 
                 // Signal 4 bit
                 if (effective_value & 0b0100000000000000000 != 0) { // Clear
-                    status_reg.* &= ~@as(u32, 0b100000000000);
+                    getSpStatusFlags().signal_4 = false;
                 }
                 if (effective_value & 0b1000000000000000000 != 0) { // Set
-                    status_reg.* |= 0b100000000000;
+                    getSpStatusFlags().signal_4 = true;
                 }
 
                 // Signal 5 bit
                 if (effective_value & 0b010000000000000000000 != 0) { // Clear
-                    status_reg.* &= ~@as(u32, 0b1000000000000);
+                    getSpStatusFlags().signal_5 = false;
                 }
                 if (effective_value & 0b100000000000000000000 != 0) { // Set
-                    status_reg.* |= 0b1000000000000;
+                    getSpStatusFlags().signal_5 = true;
                 }
 
                 // Signal 6 bit
                 if (effective_value & 0b01000000000000000000000 != 0) { // Clear
-                    status_reg.* &= ~@as(u32, 0b10000000000000);
+                    getSpStatusFlags().signal_6 = false;
                 }
                 if (effective_value & 0b10000000000000000000000 != 0) { // Set
-                    status_reg.* |= 0b10000000000000;
+                    getSpStatusFlags().signal_6 = true;
                 }
 
                 // Signal 7 bit
                 if (effective_value & 0b0100000000000000000000000 != 0) { // Clear
-                    status_reg.* &= ~@as(u32, 0b100000000000000);
+                    getSpStatusFlags().signal_7 = false;
                 }
                 if (effective_value & 0b1000000000000000000000000 != 0) { // Set
-                    status_reg.* |= 0b100000000000000;
+                    getSpStatusFlags().signal_6 = true;
                 }
             }
             return false;
@@ -362,8 +448,6 @@ pub const rcp = struct {
             reg_range_0.clearToZero();
             reg_range_1 = try MemRange.init(arena.allocator(), 2*@sizeOf(u32));
             reg_range_1.clearToZero();
-
-            reg_range_0.getWordPtr(@enumToInt(RegRange0Offset.sp_status_reg)).* = 0x00000001;
         }
     };
 
@@ -405,25 +489,24 @@ pub const rcp = struct {
             mi_intr_mask_reg = 0x0C
         };
 
-        pub const MiInterruptBits = packed union {
-            flags: packed struct(u32) {
-                sp: bool,
-                si: bool,
-                ai: bool,
-                vi: bool,
-                pi: bool,
-                dp: bool,
-                _always_zero: u26
-            },
-            bits: u32
+        pub const MiInterruptBits = packed struct(u32) {
+            sp: bool,
+            si: bool,
+            ai: bool,
+            vi: bool,
+            pi: bool,
+            dp: bool,
+            _always_zero: u26
         };
 
-        pub fn getMiInterruptFlags() *align(1) MiInterruptBits {
-            return @ptrCast(*align(1) MiInterruptBits, reg_range.getWordPtr(@enumToInt(RegRangeOffset.mi_intr_reg)));
+        pub fn getMiInterruptFlags() *MiInterruptBits {
+            return @ptrCast(*MiInterruptBits, 
+                reg_range.getWordPtr(@enumToInt(RegRangeOffset.mi_intr_reg)));
         }
 
-        pub fn getMiMaskFlags() *align(1) MiInterruptBits {
-            return @ptrCast(*align(1) MiInterruptBits, reg_range.getWordPtr(@enumToInt(RegRangeOffset.mi_intr_mask_reg)));
+        pub fn getMiMaskFlags() *MiInterruptBits {
+            return @ptrCast(*MiInterruptBits, 
+                reg_range.getWordPtr(@enumToInt(RegRangeOffset.mi_intr_mask_reg)));
         }
 
         fn miWriteEvent(offset: u32, value: u32, mask: u32) bool {
@@ -431,50 +514,50 @@ pub const rcp = struct {
             if (offset == @enumToInt(RegRangeOffset.mi_intr_mask_reg)) {
                 // SP mask
                 if (effective_value & 0b01 > 0) { // Clear
-                    getMiMaskFlags().flags.sp = false;
+                    getMiMaskFlags().sp = false;
                 }
                 if (effective_value & 0b10 > 0) { // Set
-                    getMiMaskFlags().flags.sp = true;
+                    getMiMaskFlags().sp = true;
                 }
 
                 // SI mask
                 if (effective_value & 0b0100 > 0) { // Clear
-                    getMiMaskFlags().flags.si = false;
+                    getMiMaskFlags().si = false;
                 }
                 if (effective_value & 0b1000 > 0) { // Set
-                    getMiMaskFlags().flags.si = true;
+                    getMiMaskFlags().si = true;
                 }
 
                 // AI mask
                 if (effective_value & 0b010000 > 0) { // Clear
-                    getMiMaskFlags().flags.ai = false;
+                    getMiMaskFlags().ai = false;
                 }
                 if (effective_value & 0b100000 > 0) { // Set
-                    getMiMaskFlags().flags.ai = true;
+                    getMiMaskFlags().ai = true;
                 }
 
                 // VI mask
                 if (effective_value & 0b01000000 > 0) { // Clear
-                    getMiMaskFlags().flags.vi = false;
+                    getMiMaskFlags().vi = false;
                 }
                 if (effective_value & 0b10000000 > 0) { // Set
-                    getMiMaskFlags().flags.vi = true;
+                    getMiMaskFlags().vi = true;
                 }
 
                 // PI mask
                 if (effective_value & 0b0100000000 > 0) { // Clear
-                    getMiMaskFlags().flags.pi = false;
+                    getMiMaskFlags().pi = false;
                 }
                 if (effective_value & 0b1000000000 > 0) { // Set
-                    getMiMaskFlags().flags.pi = true;
+                    getMiMaskFlags().pi = true;
                 }
 
                 // DP mask
                 if (effective_value & 0b010000000000 > 0) { // Clear
-                    getMiMaskFlags().flags.dp = false;
+                    getMiMaskFlags().dp = false;
                 }
                 if (effective_value & 0b100000000000 > 0) { // Set
-                    getMiMaskFlags().flags.dp = true;
+                    getMiMaskFlags().dp = true;
                 }
             }
             return false;
@@ -549,14 +632,14 @@ pub const rcp = struct {
             _ = value;
             _ = mask;
             if (offset == @enumToInt(RegRangeOffset.vi_current_reg)) {
-                rcp.mi.getMiInterruptFlags().flags.vi = false;
+                rcp.mi.getMiInterruptFlags().vi = false;
                 return false;
             }
             return true;
         }
 
-        pub fn getViStatusFlags() *align(1) ViStatusRegister {
-            return @ptrCast(*align(1) ViStatusRegister, reg_range.getWordPtr(
+        pub fn getViStatusFlags() *ViStatusRegister {
+            return @ptrCast(*ViStatusRegister, reg_range.getWordPtr(
                 @enumToInt(RegRangeOffset.vi_status_reg)));
         }
 
@@ -611,7 +694,7 @@ pub const rcp = struct {
                 }
 
                 if (effective_value & 0b10 != 0) { // Clear MI Interrupt bit
-                    rcp.mi.getMiInterruptFlags().flags.pi = false;
+                    rcp.mi.getMiInterruptFlags().pi = false;
                 }
                 return false;
             } else if (offset == @enumToInt(RegRangeOffset.pi_wr_len_reg)) {

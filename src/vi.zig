@@ -60,7 +60,7 @@ pub fn step() !void {
         // TODO: Verify that two VI interrupts happen in interlaced modes on hardware?
         // Perhaps they only happen on the second field?
         if (current_counter == vi_intr & ~@as(u32, 0b1)) {
-            memory.rcp.mi.getMiInterruptFlags().flags.vi = true;
+            memory.rcp.mi.getMiInterruptFlags().vi = true;
             vi_count += 1;
         }
     }

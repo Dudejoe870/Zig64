@@ -22,6 +22,8 @@ pub const FloatingPointRoundingMode = enum(u2) {
 
 pub const FloatingPointControlRegister31 = packed struct(u32) {
     rounding_mode: FloatingPointRoundingMode,
+    // TODO: Make this not use packed unions and or wait until packed unions are fixed in Zig, 
+    // because they are extremely buggy and do not work in packed structs.
     flags: packed union {
         flags: packed struct {
             inexact_operation: bool,
@@ -92,7 +94,7 @@ pub const Cop0Register = enum(u8) {
     _reserved1, // (Technically lladdr, but load linked doesn't exist on the N64)
     watchlo,
     watchhi,
-    _reserved2, // (Technically XContext, but the N64 can't go into 64-bit mode)
+    _reserved2, // (Technically xcontext, but the N64 can't go into 64-bit mode)
     _reserved3,
     _reserved4,
     _reserved5,
@@ -408,6 +410,108 @@ pub inline fn virtualToPhysical(vAddr: u32) u32 {
     return vAddr & 0x1FFFFFFF;
 }
 
+pub fn init() void {
+    cop0.raiseColdReset();
+}
+
+pub fn step() CpuError!void {
+    // Handle jumps and branches.
+    if (jump_target != null and is_delay_slot) {
+        next_pc = (pc & 0xF0000000) | jump_target.?;
+    } else if (jump_reg_target != null and is_delay_slot) {
+        next_pc = jump_reg_target.?;
+    } else if (branch_target != null and is_delay_slot) {
+        next_pc = pc +% @bitCast(u32, branch_target.?); // Relative to delay slot instruction.
+    }
+
+    // Handle exceptions (including interrupt exceptions).
+    if (cop0.current_exception != null) {
+        if (!getStatusFlags().is_error) {
+            const vector_offset: u32 = switch (
+                cop0.current_exception.? == .tlb_miss_instruction_fetch or 
+                cop0.current_exception.? == .tlb_miss_load or 
+                cop0.current_exception.? == .tlb_miss_store or 
+                cop0.current_exception.? == .tlb_invalid_instruction_fetch or
+                cop0.current_exception.? == .tlb_modification) {
+                true => 0x000,
+                false => 0x180
+            };
+            if (!getStatusFlags().is_exception) {
+                getCauseFlags().branch_delay_slot = is_delay_slot;
+                cp0[@enumToInt(Cop0Register.epc)] = switch(is_delay_slot) {
+                    true => pc - 4,
+                    false => pc
+                };
+            }
+            getStatusFlags().is_exception = true;
+            next_pc = switch (getStatusFlags().diagnostic_field.bootstrap_exception_vector) {
+                true => 0xBFC00200 + vector_offset,
+                false => 0x80000000 + vector_offset
+            };
+        } else {
+            cp0[@enumToInt(Cop0Register.errorepc)] = pc;
+            next_pc = 0xBFC00000;
+            if (system.config.hle_pif) {
+                runHlePif();
+            }
+        }
+        branch_target = null;
+        jump_target = null;
+        jump_reg_target = null;
+        is_delay_slot = false;
+        cop0.current_exception = null;
+    }
+
+    if ((jump_target != null or branch_target != null or jump_reg_target != null) and is_delay_slot) {
+        is_delay_slot = false;
+        branch_target = null;
+        jump_reg_target = null;
+        jump_target = null;
+    }
+    pc = next_pc;
+
+    // Handle delay slots.
+    if ((jump_target != null or branch_target != null or jump_reg_target != null) and !is_delay_slot) {
+        is_delay_slot = true;
+    }
+
+    gpr[0] = 0;
+
+    // TODO: Emulate this better?
+    // Unfortunately there's no way to accurately emulate the Cycle Count register
+    // without making the emulated CPU be cycle-accurate (a la Cen64)
+    // but there could be a better way to do this depending on how games want to use it.
+    //
+    // In any case, for non-cycle-accurate emulators, this is indeed a hard thing to emulate
+    // and I've noticed some emulators even change the amount to increment 
+    // based off the game manually as a hack!!! (something I'd like to avoid)
+    //
+    // Anyway, for now this should work fine.
+    const cp0_count = @truncate(u32, inst_count);
+    cp0[@enumToInt(Cop0Register.count)] = cp0_count;
+    if (cp0_count == cp0[@enumToInt(Cop0Register.compare)]) {
+        getCauseFlags().interrupts_pending.flags.timer_interrupt = true;
+    }
+
+    // Cause an RCP interrupt if we have a pending non-masked MI interrupt.
+    getCauseFlags().interrupts_pending.flags.rcp = 
+        (memory.rcp.mi.reg_range.getWordPtr(@enumToInt(memory.rcp.mi.RegRangeOffset.mi_intr_reg)).* & 0b111111) & 
+        (memory.rcp.mi.reg_range.getWordPtr(@enumToInt(memory.rcp.mi.RegRangeOffset.mi_intr_mask_reg)).* & 0b111111) > 0;
+
+    // Handle interrupts.
+    if (getStatusFlags().interrupt_enable and !(getStatusFlags().is_exception or getStatusFlags().is_error)) {
+        if (getCauseFlags().interrupts_pending.bits & getStatusFlags().interrupt_mask.bits > 0) {
+            cop0.raiseCommonException(.interrupt);
+        }
+    }
+
+    var instruction_ptr = cpu_bus.getWordPtr(virtualToPhysical(pc));
+    std.debug.assert(instruction_ptr != null);
+    try interpreter.executeInstruction(@ptrCast(*Instruction, instruction_ptr.?).*);
+    inst_count +%= 1; // Shouldn't roll over in about 6,000 years
+    // (in contrast to a 32-bit number which will roll over in 40 seconds, both numbers assuming 93.75MHz)
+}
+
 fn runHlePif() void {
     cp0[@enumToInt(Cop0Register.status)] = 0x000000E0; // PIF rom overwrites it (three bits are always set)
     // Enable Coprocessor 1.
@@ -499,108 +603,6 @@ fn runHlePif() void {
     gpr[31] = 0xFFFFFFFFA0000000 + @as(u64, cpu_bus.sp_imem_base_addr) + 0x550;
 
     next_pc = 0xA0000000 + cpu_bus.sp_dmem_base_addr + 0x40;
-}
-
-pub fn init() void {
-    cop0.raiseColdReset();
-}
-
-pub fn step() CpuError!void {
-    // Handle jumps and branches.
-    if (jump_target != null and is_delay_slot) {
-        next_pc = (pc & 0xF0000000) | jump_target.?;
-    } else if (jump_reg_target != null and is_delay_slot) {
-        next_pc = jump_reg_target.?;
-    } else if (branch_target != null and is_delay_slot) {
-        next_pc = pc +% @bitCast(u32, branch_target.?); // Relative to delay slot instruction.
-    }
-
-    // Handle exceptions (including interrupt exceptions).
-    if (cop0.current_exception != null) {
-        if (!getStatusFlags().is_error) {
-            const vector_offset: u32 = switch (
-                cop0.current_exception.? == .tlb_miss_instruction_fetch or 
-                cop0.current_exception.? == .tlb_miss_load or 
-                cop0.current_exception.? == .tlb_miss_store or 
-                cop0.current_exception.? == .tlb_invalid_instruction_fetch or
-                cop0.current_exception.? == .tlb_modification) {
-                true => 0x000,
-                false => 0x180
-            };
-            if (!getStatusFlags().is_exception) {
-                getCauseFlags().branch_delay_slot = is_delay_slot;
-                cp0[@enumToInt(Cop0Register.epc)] = switch(is_delay_slot) {
-                    true => pc - 4,
-                    false => pc
-                };
-            }
-            getStatusFlags().is_exception = true;
-            next_pc = switch (getStatusFlags().diagnostic_field.bootstrap_exception_vector) {
-                true => 0xBFC00200 + vector_offset,
-                false => 0x80000000 + vector_offset
-            };
-        } else {
-            cp0[@enumToInt(Cop0Register.errorepc)] = pc;
-            next_pc = 0xBFC00000;
-            if (system.config.hle_pif) {
-                runHlePif();
-            }
-        }
-        branch_target = null;
-        jump_target = null;
-        jump_reg_target = null;
-        is_delay_slot = false;
-        cop0.current_exception = null;
-    }
-
-    if ((jump_target != null or branch_target != null or jump_reg_target != null) and is_delay_slot) {
-        is_delay_slot = false;
-        branch_target = null;
-        jump_reg_target = null;
-        jump_target = null;
-    }
-    pc = next_pc;
-
-    // Handle delay slots.
-    if ((jump_target != null or branch_target != null or jump_reg_target != null) and !is_delay_slot) {
-        is_delay_slot = true;
-    }
-
-    gpr[0] = 0;
-
-    // TODO: Emulate this better?
-    // Unfortunately there's no way to accurately emulate the Cycle Count register
-    // without making the emulated CPU be cycle-accurate (a la Cen64)
-    // but there could be a better way to do this depending on how games want to use it.
-    //
-    // In any case, for non-cycle-accurate emulators, this is indeed a hard thing to emulate
-    // and I've noticed some emulators even change the amount to increment 
-    // based off the game manually as a hack!!! (something I'd like to avoid)
-    //
-    // Anyway, for now this should work fine.
-    const cp0_count = @truncate(u32, inst_count);
-    cp0[@enumToInt(Cop0Register.count)] = cp0_count;
-    if (cp0_count == cp0[@enumToInt(Cop0Register.compare)]) {
-        getCauseFlags().interrupts_pending.flags.timer_interrupt = true;
-    }
-
-    // Cause an RCP interrupt if we have a pending non-masked MI interrupt.
-    getCauseFlags().interrupts_pending.flags.rcp = 
-        (memory.rcp.mi.getMiInterruptFlags().bits & 0b111111) & 
-        (memory.rcp.mi.getMiMaskFlags().bits & 0b111111) > 0;
-
-    // Handle interrupts.
-    if (getStatusFlags().interrupt_enable and !(getStatusFlags().is_exception or getStatusFlags().is_error)) {
-        if (getCauseFlags().interrupts_pending.bits & getStatusFlags().interrupt_mask.bits > 0) {
-            cop0.raiseCommonException(.interrupt);
-        }
-    }
-
-    var instruction_ptr = cpu_bus.getWordPtr(virtualToPhysical(pc));
-    std.debug.assert(instruction_ptr != null);
-    try interpreter.executeInstruction(@ptrCast(*align(1) Instruction, instruction_ptr.?).*);
-    inst_count +%= 1; // Shouldn't roll over in about 6,000 years
-    // (in contrast to a 32-bit number which will roll over in 40 seconds, both numbers assuming 93.75MHz)
 }
 
 pub const cop0 = struct {
@@ -847,17 +849,22 @@ const interpreter = struct {
         next_pc = pc + 4;
     }
 
+    fn instStub(inst: Instruction) CpuError!void {
+        log.err("Unimplemented Instruction 0b{b} at address 0x{X}!", .{ inst.opcode, pc });
+        return error.NotImplemented;
+    }
+
     fn instStubSpecial(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
-        log.err("Unknown SPECIAL function 0b{b}", .{ @enumToInt(r_type.function) });
+        log.err("Unknown SPECIAL function 0b{b} at address 0x{X}!", .{ @enumToInt(r_type.function), pc });
         return error.UnknownInstruction;
     }
 
     fn instAdd(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
-        var rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
-        var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
-        var result = @addWithOverflow(rs, rt);
+        const rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
+        const rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
+        const result = @addWithOverflow(rs, rt);
         if (result.@"1" == 1) {
             cop0.raiseCommonException(.overflow);
             return;
@@ -868,9 +875,9 @@ const interpreter = struct {
 
     fn instAddi(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type;
-        var rs = @truncate(i32, @bitCast(i64, gpr[i_type.rs]));
-        var immediate = @as(i32, @bitCast(i16, i_type.immediate));
-        var result = @addWithOverflow(rs, immediate);
+        const rs = @truncate(i32, @bitCast(i64, gpr[i_type.rs]));
+        const immediate = @as(i32, @bitCast(i16, i_type.immediate));
+        const result = @addWithOverflow(rs, immediate);
         if (result.@"1" == 1) {
             cop0.raiseCommonException(.overflow);
             return;
@@ -881,16 +888,16 @@ const interpreter = struct {
 
     fn instAddiu(inst: Instruction) CpuError!void {
         const i_type = inst.data.i_type;
-        var rs = @truncate(i32, @bitCast(i64, gpr[i_type.rs]));
-        var immediate = @as(i32, @bitCast(i16, i_type.immediate));
+        const rs = @truncate(i32, @bitCast(i64, gpr[i_type.rs]));
+        const immediate = @as(i32, @bitCast(i16, i_type.immediate));
         gpr[i_type.rt] = @bitCast(u64, @as(i64, rs +% immediate));
         next_pc = pc + 4;
     }
 
     fn instAddu(inst: Instruction) CpuError!void {
         const r_type = inst.data.r_type;
-        var rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
-        var rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
+        const rs = @truncate(i32, @bitCast(i64, gpr[r_type.rs]));
+        const rt = @truncate(i32, @bitCast(i64, gpr[r_type.rt]));
         gpr[r_type.rd] = @bitCast(u64, @as(i64, rs +% rt));
         next_pc = pc + 4;
     }
@@ -926,7 +933,7 @@ const interpreter = struct {
                 try instBc1tl(inst);
                 return;
             } else {
-                log.err("Unknown COP branch condition 0b{b}", .{ @enumToInt(i_type_branch.condition) });
+                log.err("Unknown COP branch condition 0b{b} at address 0x{X}!", .{ @enumToInt(i_type_branch.condition), pc });
                 return error.UnknownInstruction;
             }
         } else if (r_type_cop.sub_opcode == Instruction.CopSubOpcode.cf) {
@@ -942,7 +949,7 @@ const interpreter = struct {
             try instMtc1(inst);
             return;
         } else {
-            log.err("Unknown COP1 sub-opcode 0b{b}", .{ @enumToInt(i_type_branch.sub_opcode) });
+            log.err("Unknown COP1 sub-opcode 0b{b} at address 0x{X}!", .{ @enumToInt(i_type_branch.sub_opcode), pc });
             return error.UnknownInstruction;
         }
     }
@@ -1028,14 +1035,14 @@ const interpreter = struct {
             try instBltzl(inst);
             return;
         } else {
-            log.err("Unknown REGIMM sub-opcode 0b{b}", .{ @enumToInt(i_type_branch.sub_opcode) });
+            log.err("Unknown REGIMM sub-opcode 0b{b} at address 0x{X}!", .{ @enumToInt(i_type_branch.sub_opcode), pc });
             return error.UnknownInstruction;
         }
     }
 
     inline fn instBgez(inst: Instruction) CpuError!void {
         const i_type_branch = inst.data.i_type_regimm_branch;
-        var rs = @bitCast(i64, gpr[i_type_branch.rs]);
+        const rs = @bitCast(i64, gpr[i_type_branch.rs]);
         if (rs >= 0) {
             branch(i_type_branch.offset);
         }
@@ -1409,7 +1416,7 @@ const interpreter = struct {
             try instMtc0(inst);
             return;
         } else {
-            log.err("Unknown COP0 function 0b{b}", .{ @enumToInt(generic.function) });
+            log.err("Unknown COP0 function 0b{b} at address 0x{X}!", .{ @enumToInt(generic.function), pc });
             return error.UnknownInstruction;
         }
     }
@@ -1852,10 +1859,5 @@ const interpreter = struct {
         const i_type = inst.data.i_type;
         gpr[i_type.rt] = gpr[i_type.rs] ^ @as(u64, i_type.immediate);
         next_pc = pc + 4;
-    }
-
-    fn instStub(inst: Instruction) CpuError!void {
-        log.warn("Unimplemented Instruction 0b{b} at address 0x{X}!", .{ inst.opcode, pc });
-        return error.NotImplemented;
     }
 };
